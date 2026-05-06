@@ -1,0 +1,47 @@
+{
+  "skill_name": "presentation-marp",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Create a 10-slide executive deck about modernizing our SDLC with AI agents for a C-level audience. Keep it concise, include one metrics slide with a chart suggestion, and use dark blue styling.",
+      "expected_output": "MARP markdown deck with keyword-first slides, dark-blue default style block, and at least one graph-oriented slide.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Turn these notes into a workshop presentation: onboarding friction, release lead time, flaky tests, and developer sentiment. We use brand colors #003366 and #FFB81C.",
+      "expected_output": "MARP markdown that applies provided brand colors as overrides, uses concise bullets, and keeps high contrast.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "I need a product update deck for Q2 with minimal text and visual emphasis. Include a comparison slide and suggest the best chart type for adoption by region.",
+      "expected_output": "MARP markdown with short bullet content, visual hierarchy with accent colors, and explicit chart recommendations.",
+      "files": []
+    },
+    {
+      "id": 4,
+      "prompt": "Create a metrics-heavy slide with these terms: Quality, Relevance, Custom, and values 92%, 84%, 77%. Use a dark table/card style and ensure no words or percentage signs split across lines.",
+      "expected_output": "MARP markdown with nowrap numeric tokens (e.g., class num), safe wrapping for words, readable dark-mode table contrast, and compact fallback guidance.",
+      "files": []
+    },
+    {
+      "id": 5,
+      "prompt": "Generate a dense comparison slide with long labels: Groundedness Assessment, Response Relevance Scoring, and Custom Domain Alignment, plus values 91%, 88%, 74%. Keep it readable on one slide.",
+      "expected_output": "Uses compact mode and safe wrapping rules without mid-word splits, keeps numeric + percent tokens on one line, and preserves alignment.",
+      "files": []
+    },
+    {
+      "id": 6,
+      "prompt": "Create a dark-themed table slide with brand colors #123A6B and #F4B400, showing Before/After metrics with trend chips (▼ 42%, ▼ 39%, ▼ 44%).",
+      "expected_output": "High-contrast dark table styling with readable header/body text under brand overrides and trend chips rendered as nowrap tokens.",
+      "files": []
+    },
+    {
+      "id": 7,
+      "prompt": "Build a KPI strip and feature list for a leadership slide where text labels are intentionally long and could wrap badly.",
+      "expected_output": "KPI and list components stay vertically aligned, avoid awkward wrapping, and apply compact fallback before breaking layout.",
+      "files": []
+    }
+  ]
+}
