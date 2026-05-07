@@ -1,0 +1,72 @@
+"""Domain layer: pure pydantic models. No I/O, no third-party clients."""
+from knowledge_extraction.domain.checkpoints import CheckpointRecord, StageStatus
+from knowledge_extraction.domain.documents import Chunk, Document, Page, Section
+from knowledge_extraction.domain.entities import (
+    UNKNOWN_TYPE,
+    Claim,
+    Entity,
+    Evidence,
+    ExtractionResult,
+    RefinementSuggestion,
+    Relationship,
+)
+from knowledge_extraction.domain.figures import (
+    ChartAxis,
+    ChartInterpretation,
+    ChartMetric,
+    ChartTrend,
+    Figure,
+    Table,
+    TableCell,
+)
+from knowledge_extraction.domain.graph import Community, GraphEdge, GraphNode
+from knowledge_extraction.domain.ontology import (
+    AliasMapping,
+    DriftEvent,
+    DriftKind,
+    EntityTypeDef,
+    MergeRecord,
+    OntologyProposal,
+    OntologyProposalSource,
+    OntologySchema,
+    OntologyStatus,
+    OntologyVersion,
+    RelationTypeDef,
+)
+
+__all__ = [
+    "UNKNOWN_TYPE",
+    "AliasMapping",
+    "ChartAxis",
+    "ChartInterpretation",
+    "ChartMetric",
+    "ChartTrend",
+    "CheckpointRecord",
+    "Chunk",
+    "Claim",
+    "Community",
+    "Document",
+    "DriftEvent",
+    "DriftKind",
+    "Entity",
+    "EntityTypeDef",
+    "Evidence",
+    "ExtractionResult",
+    "Figure",
+    "GraphEdge",
+    "GraphNode",
+    "MergeRecord",
+    "OntologyProposal",
+    "OntologyProposalSource",
+    "OntologySchema",
+    "OntologyStatus",
+    "OntologyVersion",
+    "Page",
+    "RefinementSuggestion",
+    "RelationTypeDef",
+    "Relationship",
+    "Section",
+    "StageStatus",
+    "Table",
+    "TableCell",
+]

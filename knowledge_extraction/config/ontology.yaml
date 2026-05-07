@@ -1,0 +1,67 @@
+# Seed ontology. Promoted to OntologyVersion v1.0.0 on first boot.
+version: "1.0.0"
+description: "Seed ontology for AI/ML research corpora (e.g. HAI AI Index)."
+
+entity_types:
+  - name: Organization
+    description: A company, research lab, university, or government body.
+  - name: Model
+    description: A specific AI/ML model or model family (e.g. GPT-4, Llama-3).
+  - name: Dataset
+    description: A named dataset used for training or evaluation.
+  - name: Benchmark
+    description: A named benchmark or evaluation suite.
+  - name: Country
+    description: A country or sovereign jurisdiction.
+  - name: ResearchPaper
+    description: A specific publication.
+  - name: Metric
+    description: A quantitative measure (e.g. accuracy, MMLU score).
+  - name: Trend
+    description: A directional pattern observed over time.
+  - name: Claim
+    description: A factual or evaluative assertion grounded in evidence.
+  - name: Regulation
+    description: A specific law, executive order, or policy.
+  - name: PolicyBody
+    description: A regulator, ministry, or standards body.
+  - name: Figure
+    description: A figure/chart referenced from a document.
+  - name: Table
+    description: A structured table referenced from a document.
+  - name: Section
+    description: A document section, chapter, or subsection.
+  - name: Technology
+    description: A technique, architecture, or technology category.
+
+relationship_types:
+  - name: RELEASED_BY
+    allowed_source: [Model, Dataset, Benchmark, ResearchPaper]
+    allowed_target: [Organization]
+  - name: OUTPERFORMS
+    allowed_source: [Model]
+    allowed_target: [Model]
+  - name: USES_DATASET
+    allowed_source: [Model, ResearchPaper]
+    allowed_target: [Dataset]
+  - name: SUPPORTS_CLAIM
+    allowed_source: [Figure, Table, ResearchPaper, Section]
+    allowed_target: [Claim]
+  - name: CITES
+    allowed_source: [ResearchPaper, Section, Claim]
+    allowed_target: [ResearchPaper]
+  - name: REGULATED_BY
+    allowed_source: [Organization, Technology, Model]
+    allowed_target: [Regulation, PolicyBody]
+  - name: LOCATED_IN
+    allowed_source: [Organization, PolicyBody]
+    allowed_target: [Country]
+  - name: MEASURES
+    allowed_source: [Benchmark, Metric]
+    allowed_target: [Model, Dataset, Technology]
+  - name: COMPARED_TO
+    allowed_source: [Model, Benchmark, Metric]
+    allowed_target: [Model, Benchmark, Metric]
+  - name: INCREASED_OVER_TIME
+    allowed_source: [Metric, Trend]
+    allowed_target: [Metric, Trend, Technology]

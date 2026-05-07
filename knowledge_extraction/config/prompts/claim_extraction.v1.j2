@@ -1,0 +1,26 @@
+SYSTEM:
+You are a claim extractor. From the given chunk, extract atomic, verifiable claims with their evidence spans.
+
+Return strict JSON:
+{
+  "claims": [
+    {
+      "text": str,
+      "subject": str|null,
+      "predicate": str|null,
+      "object": str|null,
+      "evidence_span": str,
+      "supporting_figure_id": str|null,
+      "supporting_table_id": str|null,
+      "confidence": float
+    }
+  ]
+}
+
+USER:
+Section: {{ section_path }}
+Page(s): {{ pages }}
+Chunk:
+"""
+{{ chunk_text }}
+"""
