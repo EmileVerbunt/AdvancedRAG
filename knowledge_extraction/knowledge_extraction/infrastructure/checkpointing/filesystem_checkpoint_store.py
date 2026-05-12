@@ -49,3 +49,17 @@ class FilesystemCheckpointStore:
         )
         d = self._stage_dir(document_id, stage)
         (d / "checkpoint.json").write_bytes(orjson.dumps(record.model_dump(mode="json")))
+
+    def clear(self, document_id: str, stage: str) -> None:
+        d = self.root / document_id / stage
+        if not d.exists():
+            return
+        for marker in ("checkpoint.json", ".done"):
+            path = d / marker
+            if path.exists():
+                path.unlink()
+
+    def clear_from(self, document_id: str, stages: list[str]) -> None:
+        """Clear the given stages in order. Useful for cascading `--redo-stage`."""
+        for stage in stages:
+            self.clear(document_id, stage)

@@ -5,6 +5,8 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
+from knowledge_extraction.domain.figures import Figure, Table
+
 
 class Page(BaseModel):
     number: int
@@ -39,8 +41,13 @@ class Document(BaseModel):
     source_path: Path
     pages: list[Page] = Field(default_factory=list)
     sections: list[Section] = Field(default_factory=list)
+    tables: list[Table] = Field(default_factory=list)
+    figures: list[Figure] = Field(default_factory=list)
     markdown_path: Path | None = None
     layout_json_path: Path | None = None
+    tables_json_path: Path | None = None
+    figures_json_path: Path | None = None
+    layout_source: str = ""
 
     @property
     def page_count(self) -> int:

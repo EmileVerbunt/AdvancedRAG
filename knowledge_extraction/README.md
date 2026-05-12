@@ -23,8 +23,18 @@ uv run ke ingest assets/hai_ai_index_report_2025.pdf
 uv run ke extract assets/hai_ai_index_report_2025.pdf --mode governed
 uv run ke graph build
 uv run ke graphrag index
+uv run ke graphrag ask "Which table shows AI model performance on page 88?" --top-k 10
+uv run ke graphrag eval
 uv run ke stats
 ```
+
+The `graphrag ask` command is a lightweight reusable retrieval scaffold for
+local experimentation. It runs hybrid lookup across claims, entities, tables,
+figures, and (optionally) graph neighbors from the latest GraphML export.
+
+`graphrag eval` runs reusable retrieval eval cases from
+`config/evals/graphrag_eval.json` (includes a SuperGLUE disambiguation case:
+benchmark/model meaning vs adhesive meaning).
 
 Discovery run on an unfamiliar corpus:
 
@@ -53,14 +63,27 @@ See [`architecture.md`](./architecture.md). Layered domain → application → i
 
 ```
 knowledge_extraction/
-  domain/            # pure pydantic models, no I/O
-  application/       # ports + pipelines + services
-  infrastructure/    # adapters: ingestion, llm, persistence, graphrag, telemetry
-  tui/               # rich dashboard
-  cli/               # typer entrypoint
+  domain/                # pure pydantic models, no I/O
+  application/
+    use_cases/           # ★ start here — `run_extraction.py` IS the pipeline
+    pipelines/           # individual stage implementations + Stage catalog
+    services/            # ontology governance, GraphRAG agent, eval
+    ports/               # Protocols (LLMPort, VisionPort, CheckpointPort, …)
+  infrastructure/        # adapters: ingestion, llm, persistence, graphrag, telemetry
+  tui/                   # rich dashboard
+  cli/                   # typer entrypoint (composition root)
 config/
   ontology.yaml
-  prompts/           # versioned jinja2 templates
-work/                # checkpoints + artifacts + sqlite + qdrant (gitignored)
+  prompts/               # versioned jinja2 templates
+  evals/                 # graphrag eval suite
+work/                    # checkpoints + artifacts + sqlite + qdrant (gitignored)
 tests/
 ```
+
+## Where to start reading
+
+1. `application/use_cases/run_extraction.py` — the entire pipeline in one file
+2. `application/pipelines/stages.py` — stage names + ordering
+3. `application/pipelines/orchestrator.py` — checkpoint-aware DAG runner
+4. `infrastructure/telemetry/observability.py` — wide events, heartbeats, token rollups
+5. `cli/main.py` — composition root that builds `ExtractionServices` and invokes the use case

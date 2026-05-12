@@ -58,6 +58,11 @@ class Settings(BaseSettings):
     # Telemetry
     otel_enabled: bool = False
     otel_exporter_otlp_endpoint: str = ""
+    otel_local_sink_path: Path = Path("./work/telemetry/spans.jsonl")
+    otel_service_name: str = "knowledge_extraction"
+    observability_heartbeat_enabled: bool = True
+    observability_heartbeat_interval_seconds: float = 30.0
+    observability_stall_threshold_seconds: float = 120.0
 
     # Logging
     log_dir: Path = Path("./work/logs")
@@ -67,6 +72,14 @@ class Settings(BaseSettings):
     default_mode: ExtractionMode = ExtractionMode.GOVERNED
     active_ontology_version: str = ""
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
+    pipeline_concurrency: int = 8
+
+    # Microsoft GraphRAG. Resolved at use-time:
+    #   1. explicit `graphrag_executable` env var if set
+    #   2. else `graphrag` on PATH
+    #   3. else `<repo>/.graphrag-venv/Scripts/graphrag.exe` if present
+    graphrag_executable: str = ""
+    graphrag_workdir: Path = Path("./work/graphrag")
 
     # Project paths (computed)
     project_root: Path = Field(default_factory=lambda: Path(__file__).resolve().parents[2])
@@ -90,6 +103,7 @@ class Settings(BaseSettings):
             self.checkpoint_path,
             self.artifact_path,
             self.log_dir,
+            self.otel_local_sink_path.parent,
         ):
             p.mkdir(parents=True, exist_ok=True)
         self.sqlite_path.parent.mkdir(parents=True, exist_ok=True)

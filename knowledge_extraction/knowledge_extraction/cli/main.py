@@ -1,9 +1,15 @@
-"""Typer CLI entrypoint — composition root."""
+"""Typer CLI entrypoint — composition root.
+
+Wiring only. The actual pipeline lives in
+:mod:`knowledge_extraction.application.use_cases.run_extraction`.
+"""
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sys
+from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -12,32 +18,40 @@ from rich.console import Console
 from rich.table import Table
 
 from knowledge_extraction.application.pipelines.stage_1_chunking import SemanticChunker
-from knowledge_extraction.application.pipelines.stage_2b_extraction_discovery import (
-    DiscoveryExtractionPipeline,
+from knowledge_extraction.application.pipelines.stages import Stage
+from knowledge_extraction.application.services.graphrag_agent import MiniGraphRagAgent
+from knowledge_extraction.application.services.graphrag_eval import (
+    GraphRagEvalCase,
+    aggregate_results,
+    evaluate_case,
 )
-from knowledge_extraction.application.pipelines.stage_2a_extraction_governed import (
-    GovernedExtractionPipeline,
+from knowledge_extraction.application.services.ms_graphrag_agent import (
+    IndexNotFoundError,
+    MsGraphRagAgent,
+    graphrag_index_available,
 )
-from knowledge_extraction.application.pipelines.stage_3_semantic_clustering import SemanticClusterer
-from knowledge_extraction.application.pipelines.stage_4_ontology_proposal import (
-    OntologyProposalPipeline,
-)
-from knowledge_extraction.application.pipelines.stage_5_graph import GraphBuildPipeline
-from knowledge_extraction.application.pipelines.orchestrator import Orchestrator
-from knowledge_extraction.application.services.canonicalization_service import CanonicalizationService
-from knowledge_extraction.application.services.drift_detector import DriftDetector
 from knowledge_extraction.application.services.ontology_governance import OntologyGovernance
 from knowledge_extraction.application.services.ontology_service import OntologyService
-from knowledge_extraction.application.services.ontology_validator import OntologyValidator
 from knowledge_extraction.application.services.prompt_registry import PromptRegistry
+from knowledge_extraction.application.use_cases.run_extraction import (
+    ExtractionRequest,
+    ExtractionServices,
+    RunExtractionUseCase,
+    pick_first_working_ingestion,
+    slice_pdf_if_requested,
+)
 from knowledge_extraction.config.settings import ExtractionMode, get_settings
 from knowledge_extraction.infrastructure.checkpointing.filesystem_checkpoint_store import (
     FilesystemCheckpointStore,
 )
 from knowledge_extraction.infrastructure.ingestion.docling_adapter import DoclingIngestionAdapter
+from knowledge_extraction.infrastructure.ingestion.document_intelligence_adapter import (
+    DocumentIntelligenceAdapter,
+)
 from knowledge_extraction.infrastructure.ingestion.pdf_renderer import PdfPageRenderer
 from knowledge_extraction.infrastructure.llm.azure_foundry_client import AzureFoundryLLM
 from knowledge_extraction.infrastructure.llm.embedding_adapter import AzureEmbeddingAdapter
+from knowledge_extraction.infrastructure.llm.vision_adapter import AzureVisionAdapter
 from knowledge_extraction.infrastructure.persistence.graph.networkx_store import NetworkXGraphStore
 from knowledge_extraction.infrastructure.persistence.sqlite.repositories import (
     GovernanceRepository,
@@ -47,7 +61,10 @@ from knowledge_extraction.infrastructure.persistence.sqlite.repositories import 
 )
 from knowledge_extraction.infrastructure.telemetry.observability import (
     bind,
+    configure_observability,
+    get_run_token_totals,
     new_run_id,
+    reset_run_token_totals,
     setup_logging,
     wide_event,
 )
@@ -59,6 +76,15 @@ ontology_app = typer.Typer(help="Ontology governance.")
 graphrag_app = typer.Typer(help="Microsoft GraphRAG integration.")
 app.add_typer(ontology_app, name="ontology")
 app.add_typer(graphrag_app, name="graphrag")
+
+# Force UTF-8 on stdout/stderr so Rich + plain prints can render answers containing
+# smart quotes, em-dashes, accented characters, etc. on Windows consoles (cp1252 default).
+# Must run before ``Console()`` is constructed below.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        with suppress(AttributeError, ValueError):
+            _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+
 console = Console()
 
 
@@ -78,6 +104,12 @@ def _bootstrap() -> tuple:
         console_format=settings.log_console_format,
     )
     bind(run_id=run_id, command=command)
+    reset_run_token_totals()
+    configure_observability(
+        heartbeat_enabled=settings.observability_heartbeat_enabled,
+        heartbeat_interval_seconds=settings.observability_heartbeat_interval_seconds,
+        stall_threshold_seconds=settings.observability_stall_threshold_seconds,
+    )
     if log_path is not None:
         bind(log_file=str(log_path))
 
@@ -93,17 +125,27 @@ def _bootstrap() -> tuple:
         import contextlib
 
         elapsed_ms = int((_time.perf_counter() - started_perf) * 1000)
+        token_totals = get_run_token_totals()
         log.info("run.finish", extra={
             "event": "run.finish",
             "duration_ms": elapsed_ms,
             "status": "ok",
             "log_file": str(log_path) if log_path else None,
+            "input_tokens": token_totals["input_tokens"],
+            "output_tokens": token_totals["output_tokens"],
+            "total_tokens": token_totals["total_tokens"],
+            "models": token_totals["models"],
         })
         for h in list(logging.getLogger().handlers):
             with contextlib.suppress(Exception):
                 h.flush()
 
-    setup_otel(settings.otel_enabled, settings.otel_exporter_otlp_endpoint or None)
+    setup_otel(
+        settings.otel_enabled,
+        settings.otel_exporter_otlp_endpoint or None,
+        local_sink_path=settings.otel_local_sink_path,
+        service_name=settings.otel_service_name,
+    )
     engine = make_engine(settings.sqlite_path)
     sf = make_session_factory(engine)
     relational = RelationalRepository(sf)
@@ -118,45 +160,38 @@ _MODE_OPT = typer.Option(None, help="discovery | governed (defaults to settings)
 _PAGES_OPT = typer.Option(None, help="limit to first N pages for smoke runs")
 _VERSION_OPT = typer.Option(None, help="explicit ontology version")
 _FRESH_OPT = typer.Option(False, "--fresh", help="ignore checkpoints and re-run every stage")
+_REDO_STAGE_OPT = typer.Option(
+    None,
+    "--redo-stage",
+    help="clear checkpoint for this stage and downstream stages (render|figures|extract|graph)",
+)
 _REASON_OPT = typer.Option(..., help="rejection reason")
 _BASE_OPT = typer.Option("", help="base version")
+_EVAL_SUITE_OPT = typer.Option(
+    Path("config/evals/graphrag_eval.json"),
+    help="Path to GraphRAG eval suite JSON file",
+)
 
 
 @app.command()
 def ingest(pdf: Path, pages: int | None = _PAGES_OPT) -> None:
     """Ingest a PDF (layout + page images) and persist artifacts."""
-    settings, relational, _, _ = _bootstrap()
+    settings, relational, governance, onto_service = _bootstrap()
     bus = EventBus()
-    asyncio.run(_ingest_only(settings, relational, bus, pdf, pages))
+    asyncio.run(_ingest_only(settings, relational, governance, onto_service, bus, pdf, pages))
 
 
-async def _ingest_only(settings, relational, bus, pdf: Path, pages_limit: int | None = None) -> None:
-    docling = DoclingIngestionAdapter()
-    renderer = PdfPageRenderer()
+async def _ingest_only(settings, relational, governance, onto_service, bus,
+                        pdf: Path, pages_limit: int | None = None) -> None:
+    """Ingest-only flow: slice + first-working-adapter + render. No extraction."""
+    services = _build_services(settings, relational, governance, onto_service, bus)
     work_dir = settings.artifact_path / pdf.stem
     work_dir.mkdir(parents=True, exist_ok=True)
-
-    source_pdf = pdf
-    if pages_limit:
-        source_pdf = _slice_pdf(pdf, work_dir / f"{pdf.stem}.first{pages_limit}.pdf", pages_limit)
-        console.print(f"[yellow]sliced[/yellow] first {pages_limit} pages -> {source_pdf.name}")
-
-    document = await docling.ingest(source_pdf, work_dir)
+    source_pdf = slice_pdf_if_requested(pdf, pages_limit, work_dir)
+    document = await pick_first_working_ingestion(services.ingestion_chain, source_pdf, work_dir)
     relational.save_document(document)
-    await renderer.render(source_pdf, work_dir / "pages", dpi=150)
+    await services.renderer.render(source_pdf, work_dir / "pages", dpi=150)
     console.print(f"[green]Ingested[/green] {pdf.name} -> {document.id} ({document.page_count} pages)")
-
-
-def _slice_pdf(src: Path, dst: Path, pages: int) -> Path:
-    import pypdfium2 as pdfium
-
-    src_doc = pdfium.PdfDocument(str(src))
-    out = pdfium.PdfDocument.new()
-    n = min(pages, len(src_doc))
-    out.import_pages(src_doc, list(range(n)))
-    out.save(str(dst))
-    src_doc.close()
-    return dst
 
 
 @app.command()
@@ -166,133 +201,57 @@ def extract(
     pages: int | None = _PAGES_OPT,
     ontology_version: str | None = _VERSION_OPT,
     fresh: bool = _FRESH_OPT,
+    redo_stage: str | None = _REDO_STAGE_OPT,
 ) -> None:
-    """Run end-to-end ingest -> chunk -> extract -> graph build for a PDF."""
+    """Run end-to-end ingest -> chunk -> render -> figures -> extract -> graph."""
     settings, relational, governance, onto_service = _bootstrap()
     selected_mode = mode or settings.default_mode
+    if redo_stage is not None:
+        try:
+            Stage(redo_stage)
+        except ValueError:
+            allowed = ", ".join(s.value for s in Stage)
+            raise typer.BadParameter(
+                f"invalid --redo-stage '{redo_stage}', expected one of: {allowed}"
+            ) from None
     bus = EventBus()
-    asyncio.run(_run_extract(settings, relational, governance, onto_service,
-                              bus, pdf, selected_mode, pages, ontology_version,
-                              resume=not fresh))
-
-
-async def _run_extract(settings, relational, governance, onto_service, bus, pdf,
-                        selected_mode: ExtractionMode, pages_limit: int | None,
-                        ontology_version: str | None, *, resume: bool = True) -> None:
-    from knowledge_extraction.infrastructure.telemetry.observability import bind, wide_event
-
-    bind(mode=selected_mode.value, pdf=pdf.name, pages_limit=pages_limit or 0)
-    docling = DoclingIngestionAdapter()
-    renderer = PdfPageRenderer()
-    chunker = SemanticChunker()
-    work_dir = settings.artifact_path / pdf.stem
-    pages_dir = work_dir / "pages"
-    work_dir.mkdir(parents=True, exist_ok=True)
-    checkpoints = FilesystemCheckpointStore(settings.checkpoint_path)
-
-    # Slice the PDF up front when --pages is provided so Docling only sees the slice.
-    source_pdf = pdf
-    if pages_limit:
-        with wide_event("ingest.slice_pdf", source=str(pdf), pages=pages_limit) as ev:
-            source_pdf = _slice_pdf(pdf, work_dir / f"{pdf.stem}.first{pages_limit}.pdf", pages_limit)
-            ev["destination"] = str(source_pdf)
-            ev["bytes"] = source_pdf.stat().st_size
-        console.print(f"[yellow]sliced[/yellow] first {pages_limit} pages -> {source_pdf.name}")
-
-    with wide_event("ingest.docling", source=str(source_pdf)) as ev:
-        document = await docling.ingest(source_pdf, work_dir)
-        ev["document_id"] = document.id
-        ev["pages"] = document.page_count
-        ev["markdown_chars"] = (document.markdown_path or work_dir / "doc.md").stat().st_size
-    relational.save_document(document)
-    bind(document_id=document.id)
-
-    markdown = (document.markdown_path or work_dir / "doc.md").read_text(encoding="utf-8")
-
-    with wide_event("chunk.semantic") as ev:
-        _sections, chunks = chunker.chunk(document, markdown)
-        ev["chunks"] = len(chunks)
-        ev["sections"] = len(_sections)
-    relational.save_chunks(chunks)
-
-    llm = AzureFoundryLLM(settings)
-    prompts = PromptRegistry(settings.prompts_dir)
-    version, schema = onto_service.active(ontology_version)
-    bind(ontology_version=version.version)
-
-    orchestrator = Orchestrator(document.id, checkpoints, bus)
-
-    async def stage_render() -> None:
-        await renderer.render(source_pdf, pages_dir, dpi=150)
-
-    results: list = []
-    if selected_mode is ExtractionMode.GOVERNED:
-        validator = OntologyValidator(schema)
-        canonicalizer = CanonicalizationService(governance)
-        drift = DriftDetector(governance, version.version)
-        governed = GovernedExtractionPipeline(
-            llm=llm, prompts=prompts, validator=validator, canonicalizer=canonicalizer,
-            drift=drift, repo=relational, schema=schema,
-            model=settings.azure_openai_extraction_model,
-        )
-
-        async def stage_extract() -> None:
-            nonlocal results
-            results = await governed.run(document.title, chunks)
-            from knowledge_extraction.tui.events import PipelineEvent
-            bus.publish(PipelineEvent("governed", "governed", {
-                "canonical_reused": governed.stats.canonical_reused,
-                "violations_prevented": governed.stats.violations_prevented,
-                "entities_unknown": governed.stats.entities_unknown,
-                "refinements_queued": len(governed.stats.refinement_suggestions),
-            }))
-    else:
-        discovery = DiscoveryExtractionPipeline(
-            llm=llm, prompts=prompts, repo=relational,
-            model=settings.azure_openai_reasoning_model,
-        )
-        embeddings = AzureEmbeddingAdapter(settings)
-        clusterer = SemanticClusterer(embeddings, model=settings.azure_openai_embedding_model)
-        proposer = OntologyProposalPipeline(
-            llm=llm, prompts=prompts, gov=governance,
-            model=settings.azure_openai_reasoning_model,
-            artifact_dir=work_dir / "ontology_candidates",
-        )
-
-        async def stage_extract() -> None:
-            findings = await discovery.run(document.title, chunks)
-            clusters = await clusterer.cluster(
-                [n for names in findings.entity_examples.values() for n in names]
-            )
-            proposal = await proposer.propose(findings, clusters, base_version=version.version)
-            from knowledge_extraction.tui.events import PipelineEvent
-            bus.publish(PipelineEvent("discovery", "discovery", {
-                "new_entity_types_proposed": len(findings.entity_type_counter),
-                "new_relationship_types_proposed": len(findings.relationship_type_counter),
-                "semantic_clusters_detected": len(clusters),
-                "proposal_id": proposal.id or 0,
-            }))
-
-    graph = NetworkXGraphStore()
-    graph_pipeline = GraphBuildPipeline(graph)
-
-    async def stage_graph() -> None:
-        stats = graph_pipeline.build(results)
-        tag = version.version
-        graph.export_graphml(settings.graph_storage_path / f"{document.id}.{tag}.graphml")
-        graph.export_jsonld(settings.graph_storage_path / f"{document.id}.{tag}.jsonld")
-        graph.export_cypher(settings.graph_storage_path / f"{document.id}.{tag}.cypher")
-        from knowledge_extraction.tui.events import PipelineEvent
-        bus.publish(PipelineEvent("graph", "metric", {**stats, "ontology_version": tag}))
-
-    orchestrator.add("render", stage_render)
-    orchestrator.add("extract", stage_extract, deps=["render"])
-    if selected_mode is ExtractionMode.GOVERNED:
-        orchestrator.add("graph", stage_graph, deps=["extract"])
-
-    await orchestrator.run(resume=resume)
-
+    services = _build_services(settings, relational, governance, onto_service, bus)
+    use_case = RunExtractionUseCase(services)
+    request = ExtractionRequest(
+        pdf=pdf,
+        mode=selected_mode,
+        pages_limit=pages,
+        ontology_version=ontology_version,
+        resume=not fresh,
+        redo_stage=redo_stage,
+    )
+    asyncio.run(use_case.execute(request))
     console.print("[green]extract complete[/green]")
+
+
+def _build_services(settings, relational, governance, onto_service, bus) -> ExtractionServices:
+    """Compose adapters + collaborators for the extraction use case."""
+    ingestion_chain: list = []
+    if settings.azure_document_intelligence_endpoint:
+        ingestion_chain.append(DocumentIntelligenceAdapter())
+    ingestion_chain.append(DoclingIngestionAdapter())
+
+    return ExtractionServices(
+        settings=settings,
+        relational=relational,
+        governance=governance,
+        onto_service=onto_service,
+        ingestion_chain=ingestion_chain,
+        renderer=PdfPageRenderer(),
+        llm=AzureFoundryLLM(settings),
+        vision=AzureVisionAdapter(settings, settings.azure_openai_vision_model),
+        embeddings=AzureEmbeddingAdapter(settings),
+        graph_store=NetworkXGraphStore(),
+        checkpoints=FilesystemCheckpointStore(settings.checkpoint_path),
+        chunker=SemanticChunker(),
+        prompts=PromptRegistry(settings.prompts_dir),
+        bus=bus,
+    )
 
 
 @app.command(name="graph")
@@ -310,7 +269,7 @@ def resume(
     pages: int | None = _PAGES_OPT,
 ) -> None:
     """Re-run extraction; checkpointed stages are skipped."""
-    extract(pdf=pdf, mode=mode, pages=pages, ontology_version=None, fresh=False)
+    extract(pdf=pdf, mode=mode, pages=pages, ontology_version=None, fresh=False, redo_stage=None)
 
 
 @app.command()
@@ -543,12 +502,235 @@ def graphrag_index() -> None:
     runner = GraphRagRunner(Path("./work/graphrag"), settings)
     with wide_event("graphrag.write_inputs", chunks=len(chunks), version=version.version):
         runner.write_inputs(version, chunks)
-    with wide_event("graphrag.index", version=version.version) as ev:
+
+    log_path = runner.workdir(version) / "logs" / "indexing-engine.log"
+
+    def _probe_index_progress() -> str | None:
+        # Tail the latest line so the heartbeat can show real progress and
+        # reset the stall timer whenever graphrag advances.
+        try:
+            if not log_path.exists():
+                return None
+            with log_path.open("rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - 4096))
+                tail = f.read().decode("utf-8", errors="replace")
+            for line in reversed(tail.splitlines()):
+                if "progress:" in line:
+                    return line.split(" - ")[-1].strip()
+            return None
+        except OSError:
+            return None
+
+    with wide_event(
+        "graphrag.index",
+        version=version.version,
+        progress_probe=_probe_index_progress,
+    ) as ev:
         code = asyncio.run(runner.index(version))
         ev["exit_code"] = code
     if code != 0:
         console.print(f"[red]graphrag index failed (exit {code}). Inspect logs in work/graphrag/{version.version}/logs[/red]")
     raise typer.Exit(code=code)
+
+
+@graphrag_app.command("ask")
+def graphrag_ask(
+    question: str = typer.Argument(..., help="Natural-language question"),
+    backend: str = typer.Option(
+        "auto", "--backend", "-b",
+        help="Retrieval backend: 'ms' (Microsoft GraphRAG), 'mini' (BM25 baseline), or 'auto' (ms if indexed, else mini).",
+    ),
+    method: str = typer.Option(
+        "auto", "--method", "-m",
+        help="MS GraphRAG search method: local | global | drift | basic | auto. Ignored for --backend mini.",
+    ),
+    top_k: int = typer.Option(8, help="[mini] Maximum retrieval hits to return"),
+    max_neighbors: int = typer.Option(5, help="[mini] Max graph neighbors per matched node"),
+    include_graph: bool = typer.Option(True, "--graph/--no-graph", help="[mini] Include graph neighborhood context"),
+    community_level: int = typer.Option(2, help="[ms] Leiden community level for global search"),
+    response_type: str = typer.Option("Multiple Paragraphs", help="[ms] Desired answer format"),
+    timeout: int = typer.Option(180, help="[ms] Per-query timeout in seconds"),
+    as_json: bool = typer.Option(False, "--json", help="Emit JSON output"),
+) -> None:
+    """Ask a question against a GraphRAG retrieval backend.
+
+    Default backend is 'auto', which picks Microsoft GraphRAG when an index is
+    available under work/graphrag/, otherwise falls back to the local BM25
+    'mini' agent.
+    """
+    settings = get_settings()
+    settings.ensure_dirs()
+
+    chosen_backend = backend.lower()
+    if chosen_backend == "auto":
+        chosen_backend = "ms" if graphrag_index_available(settings) else "mini"
+
+    if chosen_backend == "ms":
+        try:
+            agent = MsGraphRagAgent(settings)
+            ms_method = None if method.lower() == "auto" else method.lower()  # type: ignore[assignment]
+            answer = agent.ask(
+                question,
+                method=ms_method,  # type: ignore[arg-type]
+                community_level=community_level,
+                response_type=response_type,
+                timeout_seconds=timeout,
+            )
+        except IndexNotFoundError as e:
+            console.print(f"[red]{e}[/red]")
+            raise typer.Exit(code=2) from None
+
+        if as_json:
+            typer.echo(json.dumps(answer.to_dict(), ensure_ascii=True, indent=2))
+            return
+        console.print(f"[bold cyan]MS GraphRAG ({answer.method}) — {answer.duration_ms} ms[/bold cyan]")
+        console.print(answer.answer)
+        return
+
+    if chosen_backend != "mini":
+        raise typer.BadParameter(f"unknown backend: {backend!r} (expected ms | mini | auto)")
+
+    default_pdf = settings.project_root / "assets" / "hai_ai_index_report_2025.pdf"
+    default_md = settings.artifact_path / "hai_ai_index_report_2025" / "doc.md"
+    agent = MiniGraphRagAgent(
+        settings.sqlite_path,
+        settings.graph_storage_path,
+        source_pdf=default_pdf if default_pdf.exists() else None,
+        source_markdown=default_md if default_md.exists() else None,
+    )
+    result = agent.ask(
+        question,
+        top_k=top_k,
+        include_graph=include_graph,
+        max_neighbors=max_neighbors,
+    )
+    if as_json:
+        typer.echo(json.dumps(result.to_dict(), ensure_ascii=True, indent=2))
+        return
+
+    hits = Table(title="Mini GraphRAG retrieval hits")
+    hits.add_column("rank", justify="right")
+    hits.add_column("kind")
+    hits.add_column("id")
+    hits.add_column("score", justify="right")
+    hits.add_column("text")
+    for i, hit in enumerate(result.hits, start=1):
+        hits.add_row(str(i), hit.kind, hit.id, f"{hit.score:.3f}", hit.text)
+    console.print(hits)
+
+    if include_graph and result.graph_context:
+        for ctx in result.graph_context:
+            gt = Table(title=f"Graph context: {ctx.node_id} ({ctx.node_type})")
+            gt.add_column("neighbor_id")
+            gt.add_column("neighbor_label")
+            gt.add_column("neighbor_type")
+            gt.add_column("edge_types")
+            for nb in ctx.neighbors:
+                edge_types = ", ".join(str(t) for t in nb.get("edge_types", []))
+                gt.add_row(
+                    str(nb.get("id", "")),
+                    str(nb.get("label", "")),
+                    str(nb.get("type", "")),
+                    edge_types,
+                )
+            console.print(gt)
+
+
+@graphrag_app.command("eval")
+def graphrag_eval(
+    suite: Path = _EVAL_SUITE_OPT,
+    top_k: int = typer.Option(15, help="Default top-k retrieval for cases that do not specify one"),
+    as_json: bool = typer.Option(False, "--json", help="Emit JSON output"),
+) -> None:
+    """Run retrieval eval cases against the local mini GraphRAG agent."""
+    settings = get_settings()
+    settings.ensure_dirs()
+    if not suite.exists():
+        raise typer.BadParameter(f"eval suite not found: {suite}")
+
+    raw = json.loads(suite.read_text(encoding="utf-8"))
+    raw_cases = raw.get("cases", [])
+    if not isinstance(raw_cases, list) or not raw_cases:
+        raise typer.BadParameter("eval suite must define a non-empty 'cases' array")
+
+    cases: list[GraphRagEvalCase] = [GraphRagEvalCase.from_dict(c) for c in raw_cases if isinstance(c, dict)]
+    default_pdf = settings.project_root / "assets" / "hai_ai_index_report_2025.pdf"
+    default_md = settings.artifact_path / "hai_ai_index_report_2025" / "doc.md"
+    agent = MiniGraphRagAgent(
+        settings.sqlite_path,
+        settings.graph_storage_path,
+        source_pdf=default_pdf if default_pdf.exists() else None,
+        source_markdown=default_md if default_md.exists() else None,
+    )
+
+    results = []
+    for case in cases:
+        eval_question = case.query_rewrite or case.question
+        result = agent.ask(eval_question, top_k=max(1, case.top_k or top_k), include_graph=False)
+        results.append(evaluate_case(case, result.hits))
+
+    if as_json:
+        payload = {
+            "suite": str(suite),
+            "passed": sum(1 for r in results if r.passed),
+            "total": len(results),
+            "aggregates": aggregate_results(results),
+            "results": [r.to_dict() for r in results],
+        }
+        typer.echo(json.dumps(payload, ensure_ascii=True, indent=2))
+        return
+
+    table = Table(title="Mini GraphRAG eval")
+    table.add_column("case_id")
+    table.add_column("cat")
+    table.add_column("passed")
+    table.add_column("MRR", justify="right")
+    table.add_column("P@k", justify="right")
+    table.add_column("R@k", justify="right")
+    table.add_column("cite", justify="right")
+    table.add_column("reason")
+    for r in results:
+        mark = "[green]yes[/green]" if r.passed else "[red]no[/red]"
+        m = r.metrics
+        table.add_row(
+            r.case_id,
+            r.category,
+            mark,
+            f"{m.get('mrr', 0.0):.2f}",
+            f"{m.get('positive_precision_at_k', 0.0):.2f}",
+            f"{m.get('positive_recall_at_k', 0.0):.2f}",
+            f"{m.get('citation_recall', 0.0):.2f}",
+            r.reason,
+        )
+    console.print(table)
+
+    agg = aggregate_results(results)
+    summary = Table(title="Aggregates by category")
+    summary.add_column("category")
+    summary.add_column("passed")
+    summary.add_column("avg MRR", justify="right")
+    summary.add_column("avg P@k", justify="right")
+    for cat, vals in sorted(agg["by_category"].items()):
+        summary.add_row(
+            cat,
+            f"{vals['passed']}/{vals['total']}",
+            f"{vals['avg_mrr']:.2f}",
+            f"{vals['avg_precision_at_k']:.2f}",
+        )
+    overall = agg["overall"]
+    summary.add_row(
+        "[bold]OVERALL[/bold]",
+        f"[bold]{overall['passed']}/{overall['total']}[/bold]",
+        f"[bold]{overall['avg_mrr']:.2f}[/bold]",
+        f"[bold]{overall['avg_precision_at_k']:.2f}[/bold]",
+    )
+    console.print(summary)
+
+    failed = [r for r in results if not r.passed]
+    if failed:
+        raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":

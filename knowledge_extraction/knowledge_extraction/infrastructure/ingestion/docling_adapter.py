@@ -48,6 +48,7 @@ class DoclingIngestionAdapter:
             sections=sections,
             markdown_path=markdown_path,
             layout_json_path=layout_path,
+            layout_source="docling",
         )
 
     def _with_docling(self, pdf_path: Path) -> tuple[str | None, list[Page], list[Section]]:

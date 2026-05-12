@@ -16,6 +16,8 @@ from knowledge_extraction.domain.figures import (
     ChartMetric,
     ChartTrend,
     Figure,
+    LayoutBoundingRegion,
+    LayoutSpan,
     Table,
     TableCell,
 )
@@ -55,6 +57,8 @@ __all__ = [
     "Figure",
     "GraphEdge",
     "GraphNode",
+    "LayoutBoundingRegion",
+    "LayoutSpan",
     "MergeRecord",
     "OntologyProposal",
     "OntologyProposalSource",

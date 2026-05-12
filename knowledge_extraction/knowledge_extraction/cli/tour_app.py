@@ -161,11 +161,11 @@ def page_overview(bundle: dict[str, Any], prices: dict[str, dict[str, float]]) -
 def page_ingest(bundle: dict[str, Any]) -> None:
     st.header("📄 Ingest")
     st.caption(
-        "Docling parses the PDF into structured Markdown, preserving sections, tables, and "
-        "page anchors. The slice step keeps long PDFs cheap during smoke runs."
+        "Document Intelligence is the primary ingest path and captures structured layout inventory. "
+        "Docling remains a fallback. The slice step keeps long PDFs cheap during smoke runs."
     )
     slices = bundle["by_event"].get("ingest.slice_pdf", [])
-    docling = bundle["by_event"].get("ingest.docling", [])
+    ingest = bundle["by_event"].get("ingest.document_intelligence", []) or bundle["by_event"].get("ingest.docling", [])
 
     cols = st.columns(2)
     if slices:
@@ -176,10 +176,10 @@ def page_ingest(bundle: dict[str, Any]) -> None:
             st.metric("Slice duration", fmt_ms(s.get("duration_ms")))
             st.metric("Slice bytes", f"{s.get('bytes', 0):,}")
             st.code(s.get("destination", ""), language=None)
-    if docling:
-        d = docling[0]
+    if ingest:
+        d = ingest[0]
         with cols[1]:
-            st.subheader("Docling")
+            st.subheader("Ingest")
             st.metric("Pages parsed", d.get("pages", "—"))
             st.metric("Markdown chars", f"{d.get('markdown_chars', 0):,}")
             st.metric("Duration", fmt_ms(d.get("duration_ms")))

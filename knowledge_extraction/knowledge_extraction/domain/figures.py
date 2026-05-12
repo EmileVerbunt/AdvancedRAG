@@ -6,19 +6,41 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 
+class LayoutSpan(BaseModel):
+    offset: int
+    length: int
+
+
+class LayoutBoundingRegion(BaseModel):
+    page: int
+    polygon: list[float] = Field(default_factory=list)
+
+
 class TableCell(BaseModel):
     row: int
     col: int
     text: str
+    kind: str = ""
+    row_span: int = 1
+    col_span: int = 1
+    page: int | None = None
+    span_start: int | None = None
+    span_end: int | None = None
+    bounding_regions: list[LayoutBoundingRegion] = Field(default_factory=list)
+    spans: list[LayoutSpan] = Field(default_factory=list)
 
 
 class Table(BaseModel):
     id: str
     document_id: str
     page: int
+    page_end: int | None = None
     caption: str = ""
+    caption_page: int | None = None
     markdown: str = ""
     cells: list[TableCell] = Field(default_factory=list)
+    bounding_regions: list[LayoutBoundingRegion] = Field(default_factory=list)
+    spans: list[LayoutSpan] = Field(default_factory=list)
 
 
 class Figure(BaseModel):
@@ -27,6 +49,10 @@ class Figure(BaseModel):
     page: int
     caption: str = ""
     image_path: Path | None = None
+    crop_box: tuple[float, float, float, float] | None = None
+    bounding_regions: list[LayoutBoundingRegion] = Field(default_factory=list)
+    spans: list[LayoutSpan] = Field(default_factory=list)
+    elements: list[str] = Field(default_factory=list)
 
 
 class ChartAxis(BaseModel):

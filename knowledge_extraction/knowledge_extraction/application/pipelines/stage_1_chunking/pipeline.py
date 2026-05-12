@@ -25,6 +25,7 @@ class SemanticChunker:
         sections, slices = self._extract_sections(markdown, document.id, document.page_count or 1)
         chunks: list[Chunk] = []
         for section, body in zip(sections, slices, strict=True):
+            table_refs = self._tables_for_range(document, section.page_start, section.page_end)
             for chunk_text in self._split(body):
                 if not chunk_text.strip():
                     continue
@@ -36,6 +37,7 @@ class SemanticChunker:
                     text=chunk_text.strip(),
                     page_start=section.page_start,
                     page_end=section.page_end,
+                    table_refs=table_refs,
                     token_estimate=max(1, len(chunk_text) // 4),
                 ))
         return sections, chunks
@@ -96,6 +98,16 @@ class SemanticChunker:
                 buffer, size = [], 0
         if buffer:
             yield "\n\n".join(buffer)
+
+    @staticmethod
+    def _tables_for_range(document: Document, page_start: int, page_end: int) -> list[str]:
+        refs: list[str] = []
+        for table in document.tables:
+            table_end = table.page_end or table.page
+            if table.page > page_end or table_end < page_start:
+                continue
+            refs.append(table.id)
+        return refs
 
 
 def section_text(markdown: str, section: Section) -> str:

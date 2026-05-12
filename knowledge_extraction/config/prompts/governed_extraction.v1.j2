@@ -20,7 +20,7 @@ Return strict JSON matching this schema:
 {
   "entities":     [{"name": str, "type": str, "aliases": [str], "evidence_span": str, "confidence": float}],
   "relationships":[{"source": str, "target": str, "type": str, "evidence_span": str, "confidence": float}],
-  "claims":       [{"text": str, "evidence_span": str, "confidence": float}],
+  "claims":       [{"text": str, "evidence_span": str, "confidence": float, "supporting_table_id": str|null, "supporting_figure_id": str|null}],
   "refinement_suggestions": [{"kind": "entity"|"relationship", "name": str, "rationale": str}]
 }
 
@@ -33,3 +33,13 @@ Chunk text:
 """
 {{ chunk_text }}
 """
+
+{% if table_context %}
+Available tables for this chunk:
+{{ table_context }}
+{% endif %}
+
+{% if figure_context %}
+Available figures for this chunk (use IDs when setting supporting_figure_id):
+{{ figure_context }}
+{% endif %}

@@ -21,8 +21,6 @@ class Base(DeclarativeBase):
     pass
 
 
-# --- Documents / chunks ---
-
 class DocumentRow(Base):
     __tablename__ = "documents"
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -30,6 +28,39 @@ class DocumentRow(Base):
     source_path: Mapped[str] = mapped_column(String(1024))
     page_count: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class TableRow(Base):
+    __tablename__ = "tables"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    document_id: Mapped[str] = mapped_column(String(64), ForeignKey("documents.id"), index=True)
+    page: Mapped[int] = mapped_column(Integer)
+    page_end: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    caption: Mapped[str] = mapped_column(Text, default="")
+    caption_page: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    markdown: Mapped[str] = mapped_column(Text, default="")
+    bounding_regions_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    spans_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class TableCellRow(Base):
+    __tablename__ = "table_cells"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    table_id: Mapped[str] = mapped_column(String(64), ForeignKey("tables.id"), index=True)
+    row_index: Mapped[int] = mapped_column(Integer)
+    column_index: Mapped[int] = mapped_column(Integer)
+    text: Mapped[str] = mapped_column(Text)
+    kind: Mapped[str] = mapped_column(String(64), default="")
+    row_span: Mapped[int] = mapped_column(Integer, default=1)
+    col_span: Mapped[int] = mapped_column(Integer, default=1)
+    page: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    span_start: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    span_end: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    bounding_regions_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    spans_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    __table_args__ = (UniqueConstraint("table_id", "row_index", "column_index", name="uq_table_cell_pos"),)
 
 
 class ChunkRow(Base):
@@ -40,10 +71,29 @@ class ChunkRow(Base):
     text: Mapped[str] = mapped_column(Text)
     page_start: Mapped[int] = mapped_column(Integer)
     page_end: Mapped[int] = mapped_column(Integer)
+    figure_refs_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    table_refs_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     token_estimate: Mapped[int] = mapped_column(Integer, default=0)
 
 
-# --- Extracted entities / relationships / claims ---
+class FigureRow(Base):
+    __tablename__ = "figures"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    document_id: Mapped[str] = mapped_column(String(64), ForeignKey("documents.id"), index=True)
+    page: Mapped[int] = mapped_column(Integer, index=True)
+    caption: Mapped[str] = mapped_column(Text, default="")
+    image_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    crop_box_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    bounding_regions_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    spans_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    elements_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    interpretation_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    interpretation_model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    interpretation_title: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    interpretation_chart_type: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    interpretation_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
 
 class EntityRow(Base):
     __tablename__ = "entities"
@@ -71,9 +121,9 @@ class ClaimRow(Base):
     text: Mapped[str] = mapped_column(Text)
     chunk_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    supporting_figure_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    supporting_table_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
-
-# --- Prompt + LLM call ledger ---
 
 class PromptCallRow(Base):
     __tablename__ = "prompt_calls"
@@ -90,7 +140,13 @@ class PromptCallRow(Base):
     __table_args__ = (UniqueConstraint("prompt_version", "input_hash", "model", name="uq_prompt_input_model"),)
 
 
-# --- Ontology governance ---
+class ChunkExtractionRow(Base):
+    __tablename__ = "chunk_extractions"
+    chunk_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    relationship_count: Mapped[int] = mapped_column(Integer, default=0)
+    claim_count: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
 
 class OntologyVersionRow(Base):
     __tablename__ = "ontology_versions"
