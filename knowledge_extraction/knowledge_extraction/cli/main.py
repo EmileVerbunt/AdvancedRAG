@@ -641,21 +641,90 @@ def graphrag_ask(
 @graphrag_app.command("eval")
 def graphrag_eval(
     suite: Path = _EVAL_SUITE_OPT,
+    backend: str = typer.Option(
+        "mini",
+        "--backend",
+        case_sensitive=False,
+        help="Retrieval backend: 'mini' (BM25 baseline), 'ms' (Microsoft GraphRAG), "
+             "or 'both' (run both and print side-by-side comparison).",
+    ),
+    method: str = typer.Option(
+        "local",
+        "--method",
+        case_sensitive=False,
+        help="MS GraphRAG search method when --backend is 'ms' or 'both'. "
+             "'local' is fast and entity-aware (good per-case parity with mini); "
+             "'global' synthesizes across community reports (slower, ~200s/case); "
+             "'auto' picks per-question.",
+    ),
+    community_level: int = typer.Option(2, help="MS GraphRAG community level (1=fine, 4=coarse)."),
+    response_type: str = typer.Option("Multiple Paragraphs", help="MS GraphRAG response type."),
+    ms_timeout: int = typer.Option(180, help="Per-case timeout (seconds) for MS GraphRAG queries."),
     top_k: int = typer.Option(15, help="Default top-k retrieval for cases that do not specify one"),
     as_json: bool = typer.Option(False, "--json", help="Emit JSON output"),
 ) -> None:
-    """Run retrieval eval cases against the local mini GraphRAG agent."""
+    """Run retrieval eval cases against the mini and/or MS GraphRAG backends."""
     settings = get_settings()
     settings.ensure_dirs()
     if not suite.exists():
         raise typer.BadParameter(f"eval suite not found: {suite}")
 
+    chosen_backend = backend.lower()
+    if chosen_backend not in {"mini", "ms", "both"}:
+        raise typer.BadParameter(f"unknown backend: {backend!r} (expected mini | ms | both)")
+
     raw = json.loads(suite.read_text(encoding="utf-8"))
     raw_cases = raw.get("cases", [])
     if not isinstance(raw_cases, list) or not raw_cases:
         raise typer.BadParameter("eval suite must define a non-empty 'cases' array")
-
     cases: list[GraphRagEvalCase] = [GraphRagEvalCase.from_dict(c) for c in raw_cases if isinstance(c, dict)]
+
+    runs: dict[str, list] = {}
+    if chosen_backend in {"mini", "both"}:
+        runs["mini"] = _run_mini_eval(cases, settings, top_k)
+    if chosen_backend in {"ms", "both"}:
+        runs["ms"] = _run_ms_eval(
+            cases, settings,
+            method=method.lower(),
+            community_level=community_level,
+            response_type=response_type,
+            timeout_seconds=ms_timeout,
+        )
+
+    if as_json:
+        payload = {
+            "suite": str(suite),
+            "backends": {
+                name: {
+                    "passed": sum(1 for r in results if r.passed),
+                    "total": len(results),
+                    "aggregates": aggregate_results(results),
+                    "results": [r.to_dict() for r in results],
+                }
+                for name, results in runs.items()
+            },
+        }
+        typer.echo(json.dumps(payload, ensure_ascii=True, indent=2))
+        if any(any(not r.passed for r in results) for results in runs.values()):
+            raise typer.Exit(code=1)
+        return
+
+    for name, results in runs.items():
+        _print_eval_table(results, title=f"{name.upper()} GraphRAG eval")
+
+    if chosen_backend == "both":
+        _print_backend_comparison(runs)
+
+    failed = any(any(not r.passed for r in results) for results in runs.values())
+    if failed:
+        raise typer.Exit(code=1)
+
+
+def _run_mini_eval(
+    cases: list[GraphRagEvalCase],
+    settings,
+    top_k: int,
+) -> list:
     default_pdf = settings.project_root / "assets" / "hai_ai_index_report_2025.pdf"
     default_md = settings.artifact_path / "hai_ai_index_report_2025" / "doc.md"
     agent = MiniGraphRagAgent(
@@ -664,25 +733,59 @@ def graphrag_eval(
         source_pdf=default_pdf if default_pdf.exists() else None,
         source_markdown=default_md if default_md.exists() else None,
     )
-
     results = []
     for case in cases:
         eval_question = case.query_rewrite or case.question
         result = agent.ask(eval_question, top_k=max(1, case.top_k or top_k), include_graph=False)
-        results.append(evaluate_case(case, result.hits))
+        results.append(evaluate_case(case, result.hits, mode="retrieval"))
+    return results
 
-    if as_json:
-        payload = {
-            "suite": str(suite),
-            "passed": sum(1 for r in results if r.passed),
-            "total": len(results),
-            "aggregates": aggregate_results(results),
-            "results": [r.to_dict() for r in results],
-        }
-        typer.echo(json.dumps(payload, ensure_ascii=True, indent=2))
-        return
 
-    table = Table(title="Mini GraphRAG eval")
+def _run_ms_eval(
+    cases: list[GraphRagEvalCase],
+    settings,
+    *,
+    method: str,
+    community_level: int,
+    response_type: str,
+    timeout_seconds: int,
+) -> list:
+    """Run each case against MS GraphRAG, wrap the answer as a synthetic hit, evaluate."""
+    from knowledge_extraction.application.services.graphrag_agent import RetrievalHit
+
+    agent = MsGraphRagAgent(settings)
+    results = []
+    for idx, case in enumerate(cases, start=1):
+        eval_question = case.query_rewrite or case.question
+        console.print(f"[dim]ms[/dim] [{idx}/{len(cases)}] {case.case_id}: {eval_question[:80]}")
+        try:
+            answer = agent.ask(
+                eval_question,
+                method=method,  # type: ignore[arg-type]
+                community_level=community_level,
+                response_type=response_type,
+                timeout_seconds=timeout_seconds,
+            )
+            synthetic_hit = RetrievalHit(
+                kind="ms_answer",
+                id=f"ms:{case.case_id}",
+                score=1.0,
+                text=answer.answer,
+                meta={"method": answer.method, "duration_ms": answer.duration_ms},
+            )
+            results.append(evaluate_case(case, [synthetic_hit], mode="synthesis"))
+        except (RuntimeError, IndexNotFoundError) as exc:
+            console.print(f"  [red]error:[/red] {exc}")
+            error_hit = RetrievalHit(
+                kind="ms_error", id=f"ms-error:{case.case_id}", score=0.0,
+                text=f"[ms-graphrag error: {exc}]", meta={},
+            )
+            results.append(evaluate_case(case, [error_hit], mode="synthesis"))
+    return results
+
+
+def _print_eval_table(results: list, title: str) -> None:
+    table = Table(title=title)
     table.add_column("case_id")
     table.add_column("cat")
     table.add_column("passed")
@@ -695,9 +798,7 @@ def graphrag_eval(
         mark = "[green]yes[/green]" if r.passed else "[red]no[/red]"
         m = r.metrics
         table.add_row(
-            r.case_id,
-            r.category,
-            mark,
+            r.case_id, r.category, mark,
             f"{m.get('mrr', 0.0):.2f}",
             f"{m.get('positive_precision_at_k', 0.0):.2f}",
             f"{m.get('positive_recall_at_k', 0.0):.2f}",
@@ -707,7 +808,7 @@ def graphrag_eval(
     console.print(table)
 
     agg = aggregate_results(results)
-    summary = Table(title="Aggregates by category")
+    summary = Table(title=f"{title} — aggregates by category")
     summary.add_column("category")
     summary.add_column("passed")
     summary.add_column("avg MRR", justify="right")
@@ -728,9 +829,39 @@ def graphrag_eval(
     )
     console.print(summary)
 
-    failed = [r for r in results if not r.passed]
-    if failed:
-        raise typer.Exit(code=1)
+
+def _print_backend_comparison(runs: dict[str, list]) -> None:
+    """Side-by-side per-case win/loss table for the mini vs ms comparison."""
+    if "mini" not in runs or "ms" not in runs:
+        return
+    mini_by_id = {r.case_id: r for r in runs["mini"]}
+    ms_by_id = {r.case_id: r for r in runs["ms"]}
+    cmp_table = Table(title="Backend comparison (mini vs ms)")
+    cmp_table.add_column("case_id")
+    cmp_table.add_column("cat")
+    cmp_table.add_column("mini", justify="center")
+    cmp_table.add_column("ms", justify="center")
+    cmp_table.add_column("Δ", justify="center")
+    wins = {"mini": 0, "ms": 0, "tie": 0}
+    for case_id in mini_by_id:
+        mr = mini_by_id[case_id]
+        sr = ms_by_id.get(case_id)
+        mini_mark = "[green]✓[/green]" if mr.passed else "[red]✗[/red]"
+        ms_mark = "[green]✓[/green]" if (sr and sr.passed) else "[red]✗[/red]"
+        if mr.passed and sr and sr.passed:
+            delta, key = "[dim]tie[/dim]", "tie"
+        elif sr and sr.passed and not mr.passed:
+            delta, key = "[bold green]ms[/bold green]", "ms"
+        elif mr.passed and (not sr or not sr.passed):
+            delta, key = "[bold yellow]mini[/bold yellow]", "mini"
+        else:
+            delta, key = "[dim]tie[/dim]", "tie"
+        wins[key] += 1
+        cmp_table.add_row(case_id, mr.category, mini_mark, ms_mark, delta)
+    console.print(cmp_table)
+    console.print(
+        f"[bold]Wins:[/bold] ms-only={wins['ms']}, mini-only={wins['mini']}, tie={wins['tie']}"
+    )
 
 
 if __name__ == "__main__":

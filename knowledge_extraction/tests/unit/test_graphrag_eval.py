@@ -143,3 +143,73 @@ def test_aggregate_results_groups_by_category() -> None:
     assert agg["by_category"]["tabular"]["passed"] == 0
 
 
+# --- Synthesis mode (MS GraphRAG style) tests ---
+
+
+def _synthesis_hit(text: str) -> RetrievalHit:
+    return RetrievalHit(kind="ms_answer", id="ms:test", score=1.0, text=text, meta={})
+
+
+def test_synthesis_mode_passes_when_answer_contains_positive_terms() -> None:
+    case = _case()
+    answer = (
+        "SuperGLUE is a benchmark used to evaluate model performance. "
+        "The leaderboard shows GPT-4 scoring 89.4 [Data: Reports (12, 13)]."
+    )
+    result = evaluate_case(case, [_synthesis_hit(answer)], mode="synthesis")
+    assert result.passed is True
+    assert result.metrics["mrr"] == 1.0
+
+
+def test_synthesis_mode_fails_on_negative_terms() -> None:
+    case = _case()
+    answer = "Superglue cyanoacrylate adhesive bond strength is high."
+    result = evaluate_case(case, [_synthesis_hit(answer)], mode="synthesis")
+    assert result.passed is False
+    assert "negative-domain" in result.reason
+
+
+def test_synthesis_mode_skips_expected_hit_kinds_gate() -> None:
+    """expected_hit_kinds is meaningless in synthesis mode and must not gate."""
+    case = _case()
+    case.expected_hit_kinds = ["table", "figure"]  # ms_answer is none of these
+    answer = "SuperGLUE benchmark leaderboard performance score for model X is 89.4"
+    result = evaluate_case(case, [_synthesis_hit(answer)], mode="synthesis")
+    assert result.passed is True
+
+
+def test_synthesis_mode_skips_required_evidence_ids_gate() -> None:
+    """In synthesis mode the existing eval suite's chunk-IDs don't match inline citation IDs."""
+    case = _case()
+    case.required_evidence_ids = ["chunk:abc123"]
+    answer = "SuperGLUE benchmark leaderboard performance score for model X is 89.4"
+    result = evaluate_case(case, [_synthesis_hit(answer)], mode="synthesis")
+    assert result.passed is True
+
+
+def test_synthesis_mode_extracts_citation_ids_from_answer() -> None:
+    """citation_recall is computed against inline [Data: Reports (...)] tags in synthesis mode."""
+    case = _case()
+    case.required_evidence_ids = ["744", "7"]
+    answer = (
+        "SuperGLUE benchmark performance score 89.4 "
+        "[Data: Reports (744, 7, 961, +more)]."
+    )
+    result = evaluate_case(case, [_synthesis_hit(answer)], mode="synthesis")
+    assert result.metrics["citation_recall"] == 1.0
+
+
+def test_adversarial_synthesis_passes_on_refusal_marker() -> None:
+    case = GraphRagEvalCase(
+        case_id="adv-bitcoin",
+        question="What was Bitcoin's price in March 2024?",
+        query_rewrite=None, category="adversarial",
+        focus_terms=[], positive_terms=[], min_positive_term_matches=0,
+        domain_terms=[], negative_terms=[], expected_hit_kinds=[],
+        max_hit_rank=5, top_k=10,
+        is_adversarial=True, min_score_for_grounded=0.05,
+    )
+    refusal = _synthesis_hit("I don't have information on Bitcoin pricing in the supplied dataset.")
+    confab = _synthesis_hit("Bitcoin was trading around $70,000 in March 2024.")
+    assert evaluate_case(case, [refusal], mode="synthesis").passed is True
+    assert evaluate_case(case, [confab], mode="synthesis").passed is False

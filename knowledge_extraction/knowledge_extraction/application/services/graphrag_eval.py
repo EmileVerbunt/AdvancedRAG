@@ -2,8 +2,39 @@ from __future__ import annotations
 
 import re
 from dataclasses import asdict, dataclass, field
+from typing import Literal
 
 from knowledge_extraction.application.services.graphrag_agent import RetrievalHit
+
+EvalMode = Literal["retrieval", "synthesis"]
+
+# Phrases that an LLM-synthesized answer might use to refuse / disclaim grounding.
+# Used by adversarial cases in synthesis mode (the model should refuse, not confabulate).
+_REFUSAL_MARKERS: tuple[str, ...] = (
+    "don't have",
+    "don\u2019t have",
+    "do not have",
+    "cannot answer",
+    "can't answer",
+    "i'm not able",
+    "no information",
+    "no data",
+    "not in the provided",
+    "not in the supplied",
+    "not in the dataset",
+    "the dataset does not",
+    "the data does not",
+    "not mentioned",
+    "out of scope",
+    "insufficient information",
+    "no relevant",
+)
+
+# Matches MS GraphRAG inline citation tags like:
+#   [Data: Reports (744, 7, 961)]
+#   [Data: Sources (12, 13)]
+#   [Data: Entities (5, +more)]
+_CITATION_TAG_RE = re.compile(r"\[Data:\s*[^\]]+?\(([^)]+)\)\s*\]", re.IGNORECASE)
 
 
 @dataclass(slots=True)
@@ -75,15 +106,31 @@ class GraphRagEvalResult:
         return out
 
 
-def evaluate_case(case: GraphRagEvalCase, hits: list[RetrievalHit]) -> GraphRagEvalResult:
-    """Evaluate a retrieval case and produce pass/fail + numeric quality metrics.
+def evaluate_case(
+    case: GraphRagEvalCase,
+    hits: list[RetrievalHit],
+    mode: EvalMode = "retrieval",
+) -> GraphRagEvalResult:
+    """Evaluate a retrieval (or synthesis) case and produce pass/fail + numeric quality metrics.
+
+    Modes
+    -----
+    * ``"retrieval"`` — default, expects a list of ``RetrievalHit`` objects from a retriever
+      (BM25, vector, etc.). Gates on ``expected_hit_kinds`` and ``required_evidence_ids``
+      against hit metadata.
+    * ``"synthesis"`` — expects ONE synthetic hit wrapping an LLM answer (e.g. MS GraphRAG).
+      Skips ``expected_hit_kinds`` (no typed hits). For ``required_evidence_ids``, parses
+      MS-style ``[Data: Reports (id, ...)]`` citations from the answer text and matches
+      against those. For adversarial cases, checks for refusal markers in the answer
+      instead of comparing retrieval scores.
 
     Metrics produced (always, even on fail):
       * positive_recall_at_k  — fraction of positive_terms covered by top-K hits
       * positive_precision_at_k — fraction of top-K hits that contain at least one positive term
       * mrr — reciprocal rank of the first top-K hit that contains any positive term
-      * citation_recall — fraction of required_evidence_ids found in hit IDs (1.0 if none required)
-      * top_score — score of the first hit (used for adversarial-grounding check)
+      * citation_recall — fraction of required_evidence_ids found in hit IDs (or inline
+        citations in synthesis mode); 1.0 if none required
+      * top_score — score of the first hit (used for adversarial-grounding check in retrieval mode)
     """
     if not hits:
         return GraphRagEvalResult(
@@ -100,8 +147,23 @@ def evaluate_case(case: GraphRagEvalCase, hits: list[RetrievalHit]) -> GraphRagE
     k = max(1, case.max_hit_rank)
     ranked_hits = hits[:k]
 
-    # --- Adversarial case: PASS if top score is below grounding threshold ---
+    # --- Adversarial case: PASS if model correctly refuses to ground ---
     if case.is_adversarial:
+        if mode == "synthesis":
+            answer_norm = _normalize_text(top_hit.text)
+            refused = any(marker in answer_norm for marker in _REFUSAL_MARKERS)
+            return GraphRagEvalResult(
+                case_id=case.case_id, question=case.question, category=case.category,
+                passed=refused,
+                reason=(
+                    "answer correctly refused / disclaimed grounding"
+                    if refused else
+                    "answer confabulated instead of refusing (no refusal marker found)"
+                ),
+                top_hit=top_hit,
+                metrics={"top_score": top_hit.score, "positive_recall_at_k": 0.0,
+                         "positive_precision_at_k": 0.0, "mrr": 0.0, "citation_recall": 0.0},
+            )
         passed = top_hit.score < case.min_score_for_grounded
         return GraphRagEvalResult(
             case_id=case.case_id, question=case.question, category=case.category,
@@ -133,7 +195,12 @@ def evaluate_case(case: GraphRagEvalCase, hits: list[RetrievalHit]) -> GraphRagE
             mrr = 1.0 / rank
             break
 
-    cited_ids = {h.id for h in ranked_hits}
+    if mode == "synthesis":
+        # In synthesis mode, the "cited IDs" come from inline [Data: Reports (...)] tags
+        # in the answer text rather than from hit IDs.
+        cited_ids = _extract_inline_citations(top_hit.text)
+    else:
+        cited_ids = {h.id for h in ranked_hits}
     citation_recall = (
         sum(1 for rid in case.required_evidence_ids if rid in cited_ids) / len(case.required_evidence_ids)
         if case.required_evidence_ids else 1.0
@@ -148,7 +215,10 @@ def evaluate_case(case: GraphRagEvalCase, hits: list[RetrievalHit]) -> GraphRagE
     }
 
     # --- Pass/fail gates (in priority order — first failure wins) ---
-    if case.expected_hit_kinds and not any(h.kind in set(case.expected_hit_kinds) for h in ranked_hits):
+    # expected_hit_kinds only applies to retrieval mode (synthesis returns one wrapped answer).
+    if mode == "retrieval" and case.expected_hit_kinds and not any(
+        h.kind in set(case.expected_hit_kinds) for h in ranked_hits
+    ):
         return GraphRagEvalResult(
             case_id=case.case_id, question=case.question, category=case.category,
             passed=False, reason="expected evidence type not found in top ranked hits",
@@ -195,7 +265,10 @@ def evaluate_case(case: GraphRagEvalCase, hits: list[RetrievalHit]) -> GraphRagE
             top_hit=top_hit, metrics=metrics,
         )
 
-    if case.required_evidence_ids and citation_recall < 1.0:
+    # required_evidence_ids only gates retrieval mode: in synthesis mode the existing
+    # eval suite uses chunk-level IDs that don't appear in MS-style inline citations.
+    # The metric is still computed for visibility.
+    if mode == "retrieval" and case.required_evidence_ids and citation_recall < 1.0:
         missing = [rid for rid in case.required_evidence_ids if rid not in cited_ids]
         return GraphRagEvalResult(
             case_id=case.case_id, question=case.question, category=case.category,
@@ -246,4 +319,21 @@ def _normalize_text(text: str) -> str:
     t = text.lower()
     t = re.sub(r"\s+", " ", t)
     return t.strip()
+
+
+def _extract_inline_citations(text: str) -> set[str]:
+    """Pull citation IDs out of MS-style ``[Data: Reports (id1, id2, +more)]`` tags.
+
+    Returns a set of stringified IDs (e.g. ``{"744", "7", "961"}``). Tokens like
+    ``+more`` are dropped. Used by ``evaluate_case`` in synthesis mode so
+    ``required_evidence_ids`` checks work against LLM-synthesized answers.
+    """
+    ids: set[str] = set()
+    for match in _CITATION_TAG_RE.finditer(text):
+        for raw in match.group(1).split(","):
+            token = raw.strip()
+            if not token or token.startswith("+"):
+                continue
+            ids.add(token)
+    return ids
 
