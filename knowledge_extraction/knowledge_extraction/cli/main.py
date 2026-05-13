@@ -545,7 +545,8 @@ def graphrag_ask(
     question: str = typer.Argument(..., help="Natural-language question"),
     backend: str = typer.Option(
         "auto", "--backend", "-b",
-        help="Retrieval backend: 'ms' (Microsoft GraphRAG), 'mini' (BM25 baseline), or 'auto' (ms if indexed, else mini).",
+        help="Retrieval backend: 'ms' (Microsoft GraphRAG, default when indexed), "
+             "'mini' (lexical BM25 baseline), or 'auto' (ms if indexed, else mini).",
     ),
     method: str = typer.Option(
         "auto", "--method", "-m",
@@ -672,10 +673,11 @@ def graphrag_ask(
 def graphrag_eval(
     suite: Path = _EVAL_SUITE_OPT,
     backend: str = typer.Option(
-        "mini",
+        "ms",
         "--backend",
         case_sensitive=False,
-        help="Retrieval backend: 'mini' (BM25 baseline), 'ms' (Microsoft GraphRAG), "
+        help="Retrieval backend: 'ms' (Microsoft GraphRAG, default and SOTA), "
+             "'mini' (lexical BM25 baseline — kept for comparison only), "
              "or 'both' (run both and print side-by-side comparison).",
     ),
     method: str = typer.Option(

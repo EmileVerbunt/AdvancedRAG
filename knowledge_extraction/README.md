@@ -28,13 +28,15 @@ uv run ke graphrag eval
 uv run ke stats
 ```
 
-The `graphrag ask` command is a lightweight reusable retrieval scaffold for
-local experimentation. It runs hybrid lookup across claims, entities, tables,
-figures, and (optionally) graph neighbors from the latest GraphML export.
+The `graphrag ask` command queries the indexed corpus through Microsoft GraphRAG
+by default (entity-aware `local` search and community-aware `global` search). A
+lightweight lexical `mini` backend is kept as a deterministic baseline — useful
+for offline runs, regression tests, and side-by-side eval comparisons.
 
 `graphrag eval` runs reusable retrieval eval cases from
 `config/evals/graphrag_eval.json` (includes a SuperGLUE disambiguation case:
-benchmark/model meaning vs adhesive meaning).
+benchmark/model meaning vs adhesive meaning). Defaults to the `ms` backend;
+use `--backend both` to compare MS vs mini side-by-side.
 
 Discovery run on an unfamiliar corpus:
 

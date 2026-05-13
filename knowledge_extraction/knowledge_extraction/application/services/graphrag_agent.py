@@ -1,7 +1,18 @@
-"""Small reusable GraphRAG-style retrieval agent.
+"""Lexical baseline retrieval agent (kept for comparison / offline use).
 
-This module is intentionally lightweight so it can later be wrapped by MCP or
-an HTTP API without changing the retrieval core.
+The production retrieval path is :class:`MsGraphRagAgent`, which wraps the full
+Microsoft GraphRAG pipeline (entity/community-aware local + global search). This
+``MiniGraphRagAgent`` is a deterministic BM25-style scaffold over the same
+SQLite store; it serves three purposes:
+
+* **Baseline for evals** — `graphrag eval --backend both` runs both side-by-side
+  so we can attribute quality wins/losses to the GraphRAG layer specifically.
+* **Offline / no-LLM fallback** — `graphrag ask --backend mini` works without
+  the GraphRAG index or any network call, useful in CI and air-gapped runs.
+* **Foundation for MCP/HTTP wrappers** — small surface area, no I/O beyond
+  SQLite + filesystem, easy to embed.
+
+For new feature work, prefer extending :class:`MsGraphRagAgent`.
 """
 from __future__ import annotations
 
@@ -59,7 +70,10 @@ class RetrievalResult:
 
 
 class MiniGraphRagAgent:
-    """Keyword-overlap retrieval over claims, entities, tables, and figures."""
+    """Lexical-overlap baseline (BM25-style) over the SQLite knowledge store.
+
+    See module docstring for why this exists alongside :class:`MsGraphRagAgent`.
+    """
 
     def __init__(
         self,
