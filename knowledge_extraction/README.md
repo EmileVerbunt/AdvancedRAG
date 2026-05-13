@@ -33,10 +33,44 @@ by default (entity-aware `local` search and community-aware `global` search). A
 lightweight lexical `mini` backend is kept as a deterministic baseline — useful
 for offline runs, regression tests, and side-by-side eval comparisons.
 
+### Three retrieval modes
+
+| Backend  | Ingestion cost | Per-query cost | When to use |
+|----------|----------------|----------------|-------------|
+| `mini`   | $0 (chunks only) | ~0 LLM, instant | Lexical baseline; offline; regression tests |
+| `ms`     | ~$87 / ~80 min for HAI corpus | 1 LLM call | SOTA: pre-built entity/community graph |
+| `lazy`   | **$0 — reuses chunks from any normal ingest** | 2 LLM calls (~10–20 s) | LazyGraphRAG: JIT subgraph at query time, no graph build |
+
+```bash
+uv run ke graphrag ask "..." --backend lazy        # LazyGraphRAG (query-time)
+uv run ke graphrag eval --backend ms,lazy,mini     # 3-way comparison
+```
+
+`--backend auto` is unchanged: prefers `ms` if an index exists, else falls back
+to `mini`. `lazy` is opt-in only (controlled benchmark mode).
+
 `graphrag eval` runs reusable retrieval eval cases from
 `config/evals/graphrag_eval.json` (includes a SuperGLUE disambiguation case:
 benchmark/model meaning vs adhesive meaning). Defaults to the `ms` backend;
-use `--backend both` to compare MS vs mini side-by-side.
+pass a comma-separated list (`mini,lazy,ms` or `mini,ms`) for side-by-side
+comparison runs. The legacy `--backend both` shorthand is still accepted as
+`mini,ms`.
+
+#### HAI 2025 benchmark (32-case suite)
+
+| Backend | Pass | MRR  | Avg query (s) | Index ($) | Index time |
+|---------|------|------|---------------|-----------|------------|
+| mini    | 28/32 | 0.69 | <1 | $0    | n/a        |
+| lazy    | 12/32 | 0.78 | ~15 | **$0** | **0**      |
+| ms (local) | 5/32 | 0.41 | ~42 | $87.83 | ~80 min   |
+
+Eval bias caveat: the suite scores lexical overlap with chunk text, which
+favours `mini` (returns chunks verbatim). `lazy` and `ms` both synthesize
+prose, so their pass-rates undercount answer quality. Lazy nonetheless beats
+`ms` ~2.4× on this suite at zero ingestion cost. Adversarial refusal: `ms`
+2/2, `mini` 2/2, `lazy` 0/2 — lazy is currently too eager to answer
+out-of-scope questions; the synthesis prompt is a candidate for a refusal
+guard in v1.1.
 
 Discovery run on an unfamiliar corpus:
 

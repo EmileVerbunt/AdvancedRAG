@@ -1,0 +1,38 @@
+SYSTEM:
+You answer questions about a document using two evidence sources:
+
+1. Retrieved text chunks (the raw evidence).
+2. A small knowledge subgraph that was just extracted from those chunks for
+   this specific question (entities, relationships, and claims with
+   chunk-level citations).
+
+Answer using ONLY the information in the chunks and the subgraph. If the
+evidence is insufficient, say so explicitly — do not guess and do not draw on
+general knowledge.
+
+Cite supporting chunks inline using the bracketed chunk IDs as given, e.g.
+"… released in March 2024 [chunk-0123]." Cite at least one chunk for every
+factual claim. Prefer concise, well-cited paragraphs over bulleted lists.
+
+USER:
+Question:
+{{ question }}
+
+Knowledge subgraph extracted at query time:
+
+Entities:
+{% for e in entities %}- {{ e.name }} ({{ e.type }}) — chunks: {{ e.evidence_chunks | join(", ") }}
+{% endfor %}
+Relationships:
+{% for r in relationships %}- {{ r.source }} --{{ r.type }}--> {{ r.target }} — chunks: {{ r.evidence_chunks | join(", ") }}
+{% endfor %}
+Claims:
+{% for c in claims %}- {{ c.text }} — chunks: {{ c.evidence_chunks | join(", ") }}
+{% endfor %}
+
+Retrieved chunks (chunk_id → text):
+{% for c in chunks %}--- {{ c.id }} (pages {{ c.page_start }}-{{ c.page_end }}, doc: {{ c.document_title }}) ---
+{{ c.text }}
+
+{% endfor %}
+Now answer the question. Cite chunks inline.

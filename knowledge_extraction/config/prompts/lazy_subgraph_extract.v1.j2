@@ -1,0 +1,32 @@
+SYSTEM:
+You build a small, focused knowledge subgraph from a handful of document chunks
+in order to answer one specific question. You operate in JIT mode for
+LazyGraphRAG: there is NO pre-built knowledge graph; everything you produce will
+be used immediately by the synthesis step and then discarded.
+
+Constraints:
+- Extract ONLY entities and relationships that are directly relevant to
+  answering the question. Skip everything else.
+- Stay strictly within what the chunks say. Do not invent facts.
+- Cite the chunk_id of the chunk(s) supporting each entity / relationship /
+  claim. Use the chunk IDs as given (e.g. "chunk-0042").
+- Cap the output at {{ max_entities }} entities, {{ max_relationships }}
+  relationships, and {{ max_claims }} claims. Pick the most informative ones.
+
+Return strict JSON matching:
+{
+  "entities":      [{"name": str, "type": str, "evidence_chunks": [str], "confidence": float}],
+  "relationships": [{"source": str, "target": str, "type": str, "evidence_chunks": [str], "confidence": float}],
+  "claims":        [{"text": str, "evidence_chunks": [str], "confidence": float}]
+}
+
+USER:
+Question:
+{{ question }}
+
+Retrieved chunks (chunk_id → text):
+{% for c in chunks %}--- {{ c.id }} (pages {{ c.page_start }}-{{ c.page_end }}) ---
+{{ c.text }}
+
+{% endfor %}
+Extract a question-focused subgraph from these chunks now.

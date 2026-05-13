@@ -19,11 +19,16 @@ from rich.table import Table
 
 from knowledge_extraction.application.pipelines.stage_1_chunking import SemanticChunker
 from knowledge_extraction.application.pipelines.stages import Stage
+from knowledge_extraction.application.services.chunk_retriever import ChunkRetriever
 from knowledge_extraction.application.services.graphrag_agent import MiniGraphRagAgent
 from knowledge_extraction.application.services.graphrag_eval import (
     GraphRagEvalCase,
     aggregate_results,
     evaluate_case,
+)
+from knowledge_extraction.application.services.lazy_graphrag_agent import (
+    LazyGraphRagAgent,
+    lazy_index_available,
 )
 from knowledge_extraction.application.services.ms_graphrag_agent import (
     IndexNotFoundError,
@@ -546,13 +551,14 @@ def graphrag_ask(
     backend: str = typer.Option(
         "auto", "--backend", "-b",
         help="Retrieval backend: 'ms' (Microsoft GraphRAG, default when indexed), "
+             "'lazy' (LazyGraphRAG — JIT subgraph at query time, no index), "
              "'mini' (lexical BM25 baseline), or 'auto' (ms if indexed, else mini).",
     ),
     method: str = typer.Option(
         "auto", "--method", "-m",
-        help="MS GraphRAG search method: local | global | drift | basic | auto. Ignored for --backend mini.",
+        help="MS GraphRAG search method: local | global | drift | basic | auto. Ignored for --backend mini|lazy.",
     ),
-    top_k: int = typer.Option(8, help="[mini] Maximum retrieval hits to return"),
+    top_k: int = typer.Option(8, help="[mini/lazy] Maximum retrieval hits/chunks to use"),
     max_neighbors: int = typer.Option(5, help="[mini] Max graph neighbors per matched node"),
     include_graph: bool = typer.Option(True, "--graph/--no-graph", help="[mini] Include graph neighborhood context"),
     community_level: int = typer.Option(2, help="[ms] Leiden community level for global search"),
@@ -571,7 +577,8 @@ def graphrag_ask(
 
     Default backend is 'auto', which picks Microsoft GraphRAG when an index is
     available under work/graphrag/, otherwise falls back to the local BM25
-    'mini' agent.
+    'mini' agent. ``--backend lazy`` opts into the query-time-only LazyGraphRAG
+    path (skips the pre-built knowledge graph entirely).
     """
     settings = get_settings()
     settings.ensure_dirs()
@@ -602,8 +609,28 @@ def graphrag_ask(
         console.print(answer.answer)
         return
 
+    if chosen_backend == "lazy":
+        if not lazy_index_available(settings):
+            console.print(
+                f"[red]No chunks found in {settings.sqlite_path}. "
+                f"Run `ke ingest <pdf>` first to populate the chunk store.[/red]"
+            )
+            raise typer.Exit(code=2)
+        lazy_agent = _build_lazy_agent(settings)
+        lazy_answer = lazy_agent.ask(question, top_k_chunks=top_k)
+        if as_json:
+            typer.echo(json.dumps(lazy_answer.to_dict(), ensure_ascii=True, indent=2))
+            return
+        console.print(
+            f"[bold cyan]LazyGraphRAG — {lazy_answer.duration_ms} ms, "
+            f"{len(lazy_answer.chunks)} chunks, "
+            f"{lazy_answer.tokens.total} tokens[/bold cyan]"
+        )
+        console.print(lazy_answer.answer)
+        return
+
     if chosen_backend != "mini":
-        raise typer.BadParameter(f"unknown backend: {backend!r} (expected ms | mini | auto)")
+        raise typer.BadParameter(f"unknown backend: {backend!r} (expected ms | lazy | mini | auto)")
 
     default_pdf = settings.project_root / "assets" / "hai_ai_index_report_2025.pdf"
     default_md = settings.artifact_path / "hai_ai_index_report_2025" / "doc.md"
@@ -676,15 +703,17 @@ def graphrag_eval(
         "ms",
         "--backend",
         case_sensitive=False,
-        help="Retrieval backend: 'ms' (Microsoft GraphRAG, default and SOTA), "
-             "'mini' (lexical BM25 baseline — kept for comparison only), "
-             "or 'both' (run both and print side-by-side comparison).",
+        help="Retrieval backend(s): 'ms' (Microsoft GraphRAG, default and SOTA), "
+             "'lazy' (LazyGraphRAG, JIT subgraph at query time), "
+             "'mini' (lexical BM25 baseline). Pass a comma-separated list "
+             "(e.g. 'ms,lazy,mini') for a side-by-side comparison run, or use "
+             "'both' as a shorthand for 'mini,ms'.",
     ),
     method: str = typer.Option(
         "local",
         "--method",
         case_sensitive=False,
-        help="MS GraphRAG search method when --backend is 'ms' or 'both'. "
+        help="MS GraphRAG search method when --backend includes 'ms'. "
              "'local' is fast and entity-aware (good per-case parity with mini); "
              "'global' synthesizes across community reports (slower, ~200s/case); "
              "'auto' picks per-question.",
@@ -692,6 +721,7 @@ def graphrag_eval(
     community_level: int = typer.Option(2, help="MS GraphRAG community level (1=fine, 4=coarse)."),
     response_type: str = typer.Option("Multiple Paragraphs", help="MS GraphRAG response type."),
     ms_timeout: int = typer.Option(180, help="Per-case timeout (seconds) for MS GraphRAG queries."),
+    lazy_top_k: int = typer.Option(20, help="[lazy] chunks to retrieve per question."),
     top_k: int = typer.Option(15, help="Default top-k retrieval for cases that do not specify one"),
     rewrite: str = typer.Option(
         "none", "--rewrite",
@@ -702,15 +732,13 @@ def graphrag_eval(
     rewrite_n: int = typer.Option(3, "--rewrite-n", help="[mini] Number of rewrite variants."),
     as_json: bool = typer.Option(False, "--json", help="Emit JSON output"),
 ) -> None:
-    """Run retrieval eval cases against the mini and/or MS GraphRAG backends."""
+    """Run retrieval eval cases against one or more GraphRAG backends."""
     settings = get_settings()
     settings.ensure_dirs()
     if not suite.exists():
         raise typer.BadParameter(f"eval suite not found: {suite}")
 
-    chosen_backend = backend.lower()
-    if chosen_backend not in {"mini", "ms", "both"}:
-        raise typer.BadParameter(f"unknown backend: {backend!r} (expected mini | ms | both)")
+    chosen_backends = _parse_backends(backend)
 
     raw = json.loads(suite.read_text(encoding="utf-8"))
     raw_cases = raw.get("cases", [])
@@ -719,10 +747,12 @@ def graphrag_eval(
     cases: list[GraphRagEvalCase] = [GraphRagEvalCase.from_dict(c) for c in raw_cases if isinstance(c, dict)]
 
     runs: dict[str, list] = {}
-    if chosen_backend in {"mini", "both"}:
+    if "mini" in chosen_backends:
         rewriter = _build_query_rewriter(rewrite, settings)
         runs["mini"] = _run_mini_eval(cases, settings, top_k, rewriter=rewriter, rewrite_n=rewrite_n)
-    if chosen_backend in {"ms", "both"}:
+    if "lazy" in chosen_backends:
+        runs["lazy"] = _run_lazy_eval(cases, settings, top_k_chunks=lazy_top_k)
+    if "ms" in chosen_backends:
         runs["ms"] = _run_ms_eval(
             cases, settings,
             method=method.lower(),
@@ -752,12 +782,38 @@ def graphrag_eval(
     for name, results in runs.items():
         _print_eval_table(results, title=f"{name.upper()} GraphRAG eval")
 
-    if chosen_backend == "both":
+    if len(runs) > 1:
         _print_backend_comparison(runs)
 
     failed = any(any(not r.passed for r in results) for results in runs.values())
     if failed:
         raise typer.Exit(code=1)
+
+
+def _parse_backends(spec: str) -> list[str]:
+    """Parse the ``--backend`` value into an ordered, deduplicated list of backends.
+
+    Accepts a single backend (``"ms"``), a comma-separated list (``"ms,lazy,mini"``),
+    or the legacy shorthand ``"both"`` (= ``"mini,ms"``).
+    """
+    raw = (spec or "").strip().lower()
+    if not raw:
+        raise typer.BadParameter("--backend cannot be empty")
+    if raw == "both":
+        return ["mini", "ms"]
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    valid = {"mini", "ms", "lazy"}
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for p in parts:
+        if p not in valid:
+            raise typer.BadParameter(
+                f"unknown backend: {p!r} (expected combination of mini | ms | lazy, or 'both')"
+            )
+        if p not in seen:
+            seen.add(p)
+            ordered.append(p)
+    return ordered
 
 
 def _run_mini_eval(
@@ -857,6 +913,59 @@ def _run_ms_eval(
     return results
 
 
+def _build_lazy_agent(settings) -> LazyGraphRagAgent:
+    """Wire a :class:`LazyGraphRagAgent` from the standard settings.
+
+    Used by both ``graphrag ask --backend lazy`` and the eval harness.
+    """
+    llm = AzureFoundryLLM(settings)
+    prompts = PromptRegistry(settings.prompts_dir)
+    chunk_retriever = ChunkRetriever(settings.sqlite_path)
+    return LazyGraphRagAgent(settings, chunk_retriever, llm, prompts)
+
+
+def _run_lazy_eval(
+    cases: list[GraphRagEvalCase],
+    settings,
+    *,
+    top_k_chunks: int,
+) -> list:
+    """Run each case through LazyGraphRAG and evaluate the synthesized answer."""
+    from knowledge_extraction.application.services.graphrag_agent import RetrievalHit
+
+    if not lazy_index_available(settings):
+        raise typer.BadParameter(
+            f"No chunks found in {settings.sqlite_path}. Run `ke ingest <pdf>` first."
+        )
+    agent = _build_lazy_agent(settings)
+    results = []
+    for idx, case in enumerate(cases, start=1):
+        eval_question = case.query_rewrite or case.question
+        console.print(f"[dim]lazy[/dim] [{idx}/{len(cases)}] {case.case_id}: {eval_question[:80]}")
+        try:
+            answer = agent.ask(eval_question, top_k_chunks=top_k_chunks)
+            synthetic_hit = RetrievalHit(
+                kind="lazy_answer",
+                id=f"lazy:{case.case_id}",
+                score=1.0,
+                text=answer.answer,
+                meta={
+                    "duration_ms": answer.duration_ms,
+                    "tokens": answer.tokens.total,
+                    "chunks": len(answer.chunks),
+                },
+            )
+            results.append(evaluate_case(case, [synthetic_hit], mode="synthesis"))
+        except RuntimeError as exc:
+            console.print(f"  [red]error:[/red] {exc}")
+            error_hit = RetrievalHit(
+                kind="lazy_error", id=f"lazy-error:{case.case_id}", score=0.0,
+                text=f"[lazy-graphrag error: {exc}]", meta={},
+            )
+            results.append(evaluate_case(case, [error_hit], mode="synthesis"))
+    return results
+
+
 def _print_eval_table(results: list, title: str) -> None:
     table = Table(title=title)
     table.add_column("case_id")
@@ -904,37 +1013,50 @@ def _print_eval_table(results: list, title: str) -> None:
 
 
 def _print_backend_comparison(runs: dict[str, list]) -> None:
-    """Side-by-side per-case win/loss table for the mini vs ms comparison."""
-    if "mini" not in runs or "ms" not in runs:
+    """Side-by-side per-case win/loss table across all run backends.
+
+    Generalised to any subset of {mini, lazy, ms}: prints one column per backend,
+    plus a summary line counting how many cases each backend solved exclusively.
+    """
+    if len(runs) < 2:
         return
-    mini_by_id = {r.case_id: r for r in runs["mini"]}
-    ms_by_id = {r.case_id: r for r in runs["ms"]}
-    cmp_table = Table(title="Backend comparison (mini vs ms)")
+    backends = list(runs.keys())
+    by_id: dict[str, dict[str, object]] = {b: {r.case_id: r for r in runs[b]} for b in backends}
+    case_ids = list(next(iter(by_id.values())).keys())
+
+    cmp_table = Table(title=f"Backend comparison ({' vs '.join(backends)})")
     cmp_table.add_column("case_id")
     cmp_table.add_column("cat")
-    cmp_table.add_column("mini", justify="center")
-    cmp_table.add_column("ms", justify="center")
-    cmp_table.add_column("Δ", justify="center")
-    wins = {"mini": 0, "ms": 0, "tie": 0}
-    for case_id in mini_by_id:
-        mr = mini_by_id[case_id]
-        sr = ms_by_id.get(case_id)
-        mini_mark = "[green]✓[/green]" if mr.passed else "[red]✗[/red]"
-        ms_mark = "[green]✓[/green]" if (sr and sr.passed) else "[red]✗[/red]"
-        if mr.passed and sr and sr.passed:
-            delta, key = "[dim]tie[/dim]", "tie"
-        elif sr and sr.passed and not mr.passed:
-            delta, key = "[bold green]ms[/bold green]", "ms"
-        elif mr.passed and (not sr or not sr.passed):
-            delta, key = "[bold yellow]mini[/bold yellow]", "mini"
+    for b in backends:
+        cmp_table.add_column(b, justify="center")
+    cmp_table.add_column("winner", justify="center")
+
+    exclusive_wins = dict.fromkeys(backends, 0)
+    all_pass = 0
+    all_fail = 0
+    for case_id in case_ids:
+        per_backend = {b: by_id[b].get(case_id) for b in backends}
+        passes = {b: bool(r and r.passed) for b, r in per_backend.items()}
+        category = next((r.category for r in per_backend.values() if r is not None), "")
+        marks = ["[green]✓[/green]" if passes[b] else "[red]✗[/red]" for b in backends]
+        n_pass = sum(passes.values())
+        if n_pass == len(backends):
+            winner = "[dim]all[/dim]"
+            all_pass += 1
+        elif n_pass == 0:
+            winner = "[dim]none[/dim]"
+            all_fail += 1
+        elif n_pass == 1:
+            sole = next(b for b, p in passes.items() if p)
+            winner = f"[bold green]{sole}[/bold green]"
+            exclusive_wins[sole] += 1
         else:
-            delta, key = "[dim]tie[/dim]", "tie"
-        wins[key] += 1
-        cmp_table.add_row(case_id, mr.category, mini_mark, ms_mark, delta)
+            winner = "[yellow]" + ",".join(b for b, p in passes.items() if p) + "[/yellow]"
+        cmp_table.add_row(case_id, category, *marks, winner)
     console.print(cmp_table)
-    console.print(
-        f"[bold]Wins:[/bold] ms-only={wins['ms']}, mini-only={wins['mini']}, tie={wins['tie']}"
-    )
+
+    summary = ", ".join(f"{b}-only={n}" for b, n in exclusive_wins.items())
+    console.print(f"[bold]Exclusive wins:[/bold] {summary} | all-pass={all_pass} | all-fail={all_fail}")
 
 
 if __name__ == "__main__":
