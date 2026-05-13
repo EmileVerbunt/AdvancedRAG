@@ -418,6 +418,97 @@ def page_cost(bundle: dict[str, Any], prices: dict[str, dict[str, float]]) -> No
     st.dataframe(df_all, use_container_width=True)
 
 
+def page_flame(bundle: dict[str, Any]) -> None:
+    """Plotly timeline / flame chart of every wide event in the run."""
+    import plotly.express as px
+
+    st.header("🔥 Flame chart / span timeline")
+    st.caption(
+        "Every wide event with its wall-clock start, duration, and depth (computed "
+        "by interval containment). Hover for tokens / model / status."
+    )
+
+    c1, c2 = st.columns([1, 1])
+    show_heartbeats = c1.toggle("Show heartbeat / stalled events", value=False)
+    color_by = c2.radio(
+        "Color by", ["event prefix", "event", "status"], horizontal=True,
+    )
+
+    rows: list[dict[str, Any]] = []
+    for r in bundle["records"]:
+        ev = r.get("event")
+        ts = r.get("ts")
+        dur = r.get("duration_ms")
+        if not ev or not ts or dur is None:
+            continue
+        if not show_heartbeats and (".heartbeat" in ev or ".stalled" in ev):
+            continue
+        try:
+            start = pd.to_datetime(ts, utc=True)
+        except (ValueError, TypeError):
+            continue
+        end = start + pd.Timedelta(milliseconds=int(dur))
+        rows.append({
+            "event": ev,
+            "prefix": ev.split(".", 1)[0],
+            "start": start,
+            "end": end,
+            "duration_ms": int(dur),
+            "status": r.get("status", "?"),
+            "model": r.get("model", ""),
+            "input_tokens": r.get("input_tokens", r.get("input_tokens_self", 0)),
+            "output_tokens": r.get("output_tokens", r.get("output_tokens_self", 0)),
+        })
+
+    if not rows:
+        st.info("No completed events with `ts` + `duration_ms` in this run.")
+        return
+
+    df = pd.DataFrame(rows).sort_values("start").reset_index(drop=True)
+
+    # Flame depth: a span's depth is how many open ancestor spans contain it.
+    open_spans: list[tuple[pd.Timestamp, int]] = []
+    depths: list[int] = []
+    for row in df.itertuples(index=False):
+        open_spans = [(e, d) for (e, d) in open_spans if e > row.start]
+        depths.append(len(open_spans))
+        open_spans.append((row.end, len(open_spans)))
+    df["depth"] = depths
+
+    color_col = {"event prefix": "prefix", "event": "event",
+                 "status": "status"}[color_by]
+
+    fig = px.timeline(
+        df,
+        x_start="start",
+        x_end="end",
+        y="depth",
+        color=color_col,
+        hover_data=["event", "duration_ms", "status", "model",
+                    "input_tokens", "output_tokens"],
+    )
+    fig.update_yaxes(autorange="reversed", title="depth (0 = top-level)")
+    fig.update_layout(
+        height=max(400, 60 + 28 * (df["depth"].max() + 1)),
+        margin={"l": 10, "r": 10, "t": 30, "b": 10},
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02},
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    c3, c4, c5 = st.columns(3)
+    c3.metric("Spans plotted", f"{len(df):,}")
+    c4.metric("Total wallclock",
+              fmt_ms((df["end"].max() - df["start"].min()).total_seconds() * 1000))
+    c5.metric("Σ self-time", fmt_ms(int(df["duration_ms"].sum())))
+
+    st.subheader("Top 20 longest spans")
+    topn = df.nlargest(20, "duration_ms")[
+        ["event", "duration_ms", "status", "model", "depth",
+         "input_tokens", "output_tokens"]
+    ]
+    st.dataframe(topn, use_container_width=True)
+
+
 # --------------------------------------------------------------------------------------- #
 # App entry                                                                                #
 # --------------------------------------------------------------------------------------- #
@@ -454,6 +545,7 @@ def main() -> None:
             "Steps",
             [
                 "Overview",
+                "🔥 Flame chart",
                 "📄 Ingest",
                 "✂️ Chunking",
                 "🧠 Extraction",
@@ -465,6 +557,8 @@ def main() -> None:
 
     if page == "Overview":
         page_overview(bundle, prices)
+    elif page == "🔥 Flame chart":
+        page_flame(bundle)
     elif page == "📄 Ingest":
         page_ingest(bundle)
     elif page == "✂️ Chunking":
