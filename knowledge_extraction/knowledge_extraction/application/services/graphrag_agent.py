@@ -11,6 +11,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from knowledge_extraction.application.services.query_rewriter import reciprocal_rank_fusion
+
 _TOKEN_RE = re.compile(r"[a-z0-9]{3,}")
 _DATE_PATTERN = re.compile(r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2},?\s+20\d{2}\b", re.I)
 _MONTH_YEAR_PATTERN = re.compile(r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+20\d{2}\b", re.I)
@@ -102,6 +104,56 @@ class MiniGraphRagAgent:
             question=question,
             query_terms=sorted(terms),
             hits=hits,
+            graph_context=graph_context,
+        )
+
+    def ask_multi(
+        self,
+        queries: list[str],
+        *,
+        top_k: int = 8,
+        include_graph: bool = True,
+        max_neighbors: int = 5,
+    ) -> RetrievalResult:
+        """Run retrieval for each query, fuse with Reciprocal Rank Fusion.
+
+        Use this with a :class:`QueryRewriter` to combine the original question
+        with paraphrases — variants surface different chunks; RRF picks the items
+        ranked highly by *any* variant. Graph context is computed once on the
+        final fused hits.
+        """
+        if not queries:
+            return RetrievalResult(question="", query_terms=[], hits=[], graph_context=[])
+        if len(queries) == 1:
+            return self.ask(
+                queries[0],
+                top_k=top_k,
+                include_graph=include_graph,
+                max_neighbors=max_neighbors,
+            )
+
+        # Over-fetch per variant so RRF has more raw signal to fuse.
+        per_variant_top_k = max(top_k * 2, top_k + 4)
+        per_query_hits: list[list[RetrievalHit]] = []
+        union_terms: set[str] = set()
+        for q in queries:
+            result = self.ask(q, top_k=per_variant_top_k, include_graph=False)
+            per_query_hits.append(result.hits)
+            union_terms.update(result.query_terms)
+
+        fused = reciprocal_rank_fusion(
+            per_query_hits,
+            key=lambda h: f"{h.kind}:{h.id}",
+        )[: max(1, top_k)]
+
+        graph_context: list[GraphContext] = []
+        if include_graph and fused:
+            graph_context = self._graph_context(fused, max_neighbors=max_neighbors)
+
+        return RetrievalResult(
+            question=queries[0],
+            query_terms=sorted(union_terms),
+            hits=fused,
             graph_context=graph_context,
         )
 

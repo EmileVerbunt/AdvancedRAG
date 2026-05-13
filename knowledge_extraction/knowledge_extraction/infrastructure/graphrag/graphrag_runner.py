@@ -84,12 +84,19 @@ class GraphRagRunner:
         # 2) Overwrite settings.yaml with our Azure-aware config.
         (wd / "settings.yaml").write_text(self._azure_settings_yaml(), encoding="utf-8")
 
-        # 3) Write .env with API key. graphrag 2.7 requires api_key auth for chat models,
+        # 3) Overlay any custom prompt templates we ship in config/graphrag_prompts/.
+        #    `graphrag init --force` regenerates the default prompts every time, so
+        #    customizations have to be re-applied here. The local_search prompt in
+        #    particular trades the default's strict refusal stance for a graceful
+        #    fallback (see config/graphrag_prompts/local_search_system_prompt.txt).
+        self._overlay_custom_prompts(wd)
+
+        # 4) Write .env with API key. graphrag 2.7 requires api_key auth for chat models,
         #    so in CREDENTIAL mode we fetch a short-lived bearer token from DefaultAzureCredential.
         api_key = self._resolve_api_key()
         (wd / ".env").write_text(f"GRAPHRAG_API_KEY={api_key}\n", encoding="utf-8")
 
-        # 4) Write chunk texts as input/*.txt; clear stale text inputs first.
+        # 5) Write chunk texts as input/*.txt; clear stale text inputs first.
         in_dir = wd / "input"
         in_dir.mkdir(parents=True, exist_ok=True)
         for stale in in_dir.glob("*.txt"):
@@ -109,6 +116,32 @@ class GraphRagRunner:
             "auth": self._settings.azure_auth_mode.value,
         })
         return wd
+
+    def _overlay_custom_prompts(self, wd: Path) -> int:
+        """Copy ``config/graphrag_prompts/*.txt`` over the freshly-init'd defaults.
+
+        Returns the number of templates overlaid. Safe to call when no custom
+        templates exist (returns 0).
+        """
+        # repo root: this file lives at <root>/knowledge_extraction/infrastructure/graphrag/graphrag_runner.py
+        repo_root = Path(__file__).resolve().parents[3]
+        src_dir = repo_root / "config" / "graphrag_prompts"
+        if not src_dir.is_dir():
+            return 0
+        dst_dir = wd / "prompts"
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        n = 0
+        for src in src_dir.glob("*.txt"):
+            (dst_dir / src.name).write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+            n += 1
+        if n:
+            log.info("graphrag custom prompts overlaid", extra={
+                "event": "graphrag.prompts.overlay",
+                "workdir": str(wd),
+                "count": n,
+                "source": str(src_dir),
+            })
+        return n
 
     def _resolve_api_key(self) -> str:
         """Return an Azure OpenAI API key — either the configured static key, or a

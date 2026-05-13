@@ -33,6 +33,11 @@ from knowledge_extraction.application.services.ms_graphrag_agent import (
 from knowledge_extraction.application.services.ontology_governance import OntologyGovernance
 from knowledge_extraction.application.services.ontology_service import OntologyService
 from knowledge_extraction.application.services.prompt_registry import PromptRegistry
+from knowledge_extraction.application.services.query_rewriter import (
+    LexicalQueryRewriter,
+    LlmQueryRewriter,
+    QueryRewriter,
+)
 from knowledge_extraction.application.use_cases.run_extraction import (
     ExtractionRequest,
     ExtractionServices,
@@ -552,6 +557,13 @@ def graphrag_ask(
     community_level: int = typer.Option(2, help="[ms] Leiden community level for global search"),
     response_type: str = typer.Option("Multiple Paragraphs", help="[ms] Desired answer format"),
     timeout: int = typer.Option(180, help="[ms] Per-query timeout in seconds"),
+    rewrite: str = typer.Option(
+        "none", "--rewrite",
+        case_sensitive=False,
+        help="[mini] Query rewriting: none | lexical | llm. With lexical|llm, the agent retrieves "
+             "for each variant and fuses with Reciprocal Rank Fusion.",
+    ),
+    rewrite_n: int = typer.Option(3, "--rewrite-n", help="[mini] Number of rewrite variants (excludes the original)."),
     as_json: bool = typer.Option(False, "--json", help="Emit JSON output"),
 ) -> None:
     """Ask a question against a GraphRAG retrieval backend.
@@ -600,15 +612,33 @@ def graphrag_ask(
         source_pdf=default_pdf if default_pdf.exists() else None,
         source_markdown=default_md if default_md.exists() else None,
     )
-    result = agent.ask(
-        question,
-        top_k=top_k,
-        include_graph=include_graph,
-        max_neighbors=max_neighbors,
-    )
+    rewriter = _build_query_rewriter(rewrite, settings)
+    queries = _expand_queries(question, rewriter, n=rewrite_n)
+    if rewriter is not None and len(queries) > 1:
+        result = agent.ask_multi(
+            queries,
+            top_k=top_k,
+            include_graph=include_graph,
+            max_neighbors=max_neighbors,
+        )
+    else:
+        result = agent.ask(
+            question,
+            top_k=top_k,
+            include_graph=include_graph,
+            max_neighbors=max_neighbors,
+        )
     if as_json:
-        typer.echo(json.dumps(result.to_dict(), ensure_ascii=True, indent=2))
+        payload = result.to_dict()
+        if rewriter is not None and len(queries) > 1:
+            payload["rewrites"] = queries[1:]
+        typer.echo(json.dumps(payload, ensure_ascii=True, indent=2))
         return
+
+    if rewriter is not None and len(queries) > 1:
+        console.print(f"[dim]rewrites ({rewrite}, n={len(queries) - 1}):[/dim]")
+        for q in queries[1:]:
+            console.print(f"  • {q}")
 
     hits = Table(title="Mini GraphRAG retrieval hits")
     hits.add_column("rank", justify="right")
@@ -661,6 +691,13 @@ def graphrag_eval(
     response_type: str = typer.Option("Multiple Paragraphs", help="MS GraphRAG response type."),
     ms_timeout: int = typer.Option(180, help="Per-case timeout (seconds) for MS GraphRAG queries."),
     top_k: int = typer.Option(15, help="Default top-k retrieval for cases that do not specify one"),
+    rewrite: str = typer.Option(
+        "none", "--rewrite",
+        case_sensitive=False,
+        help="[mini] Query rewriting: none | lexical | llm. With lexical|llm, mini "
+             "retrieves for each variant and fuses with Reciprocal Rank Fusion.",
+    ),
+    rewrite_n: int = typer.Option(3, "--rewrite-n", help="[mini] Number of rewrite variants."),
     as_json: bool = typer.Option(False, "--json", help="Emit JSON output"),
 ) -> None:
     """Run retrieval eval cases against the mini and/or MS GraphRAG backends."""
@@ -681,7 +718,8 @@ def graphrag_eval(
 
     runs: dict[str, list] = {}
     if chosen_backend in {"mini", "both"}:
-        runs["mini"] = _run_mini_eval(cases, settings, top_k)
+        rewriter = _build_query_rewriter(rewrite, settings)
+        runs["mini"] = _run_mini_eval(cases, settings, top_k, rewriter=rewriter, rewrite_n=rewrite_n)
     if chosen_backend in {"ms", "both"}:
         runs["ms"] = _run_ms_eval(
             cases, settings,
@@ -724,6 +762,9 @@ def _run_mini_eval(
     cases: list[GraphRagEvalCase],
     settings,
     top_k: int,
+    *,
+    rewriter: QueryRewriter | None = None,
+    rewrite_n: int = 3,
 ) -> list:
     default_pdf = settings.project_root / "assets" / "hai_ai_index_report_2025.pdf"
     default_md = settings.artifact_path / "hai_ai_index_report_2025" / "doc.md"
@@ -736,9 +777,39 @@ def _run_mini_eval(
     results = []
     for case in cases:
         eval_question = case.query_rewrite or case.question
-        result = agent.ask(eval_question, top_k=max(1, case.top_k or top_k), include_graph=False)
+        case_top_k = max(1, case.top_k or top_k)
+        queries = _expand_queries(eval_question, rewriter, n=rewrite_n)
+        if rewriter is not None and len(queries) > 1:
+            result = agent.ask_multi(queries, top_k=case_top_k, include_graph=False)
+        else:
+            result = agent.ask(eval_question, top_k=case_top_k, include_graph=False)
         results.append(evaluate_case(case, result.hits, mode="retrieval"))
     return results
+
+
+def _build_query_rewriter(mode: str, settings) -> QueryRewriter | None:
+    """Map ``--rewrite none|lexical|llm`` to a :class:`QueryRewriter` (or ``None``)."""
+    m = (mode or "none").lower()
+    if m in ("", "none", "off", "false"):
+        return None
+    if m == "lexical":
+        return LexicalQueryRewriter()
+    if m == "llm":
+        from knowledge_extraction.infrastructure.llm.azure_foundry_client import AzureFoundryLLM
+        llm = AzureFoundryLLM(settings)
+        return LlmQueryRewriter(
+            llm=llm,
+            model=settings.azure_openai_extraction_model,
+            fallback=LexicalQueryRewriter(),
+        )
+    raise typer.BadParameter(f"unknown --rewrite mode: {mode!r} (expected none | lexical | llm)")
+
+
+def _expand_queries(question: str, rewriter: QueryRewriter | None, *, n: int) -> list[str]:
+    """Return [original, *variants]; just [original] when no rewriter is supplied."""
+    if rewriter is None or n <= 0:
+        return [question]
+    return rewriter.rewrite(question, n=n)
 
 
 def _run_ms_eval(
