@@ -1,5 +1,5 @@
 from knowledge_extraction.application.pipelines.stage_1_chunking import SemanticChunker
-from knowledge_extraction.domain import Document
+from knowledge_extraction.domain import Document, Page
 
 
 def _doc(doc_id: str = "d1") -> Document:
@@ -85,3 +85,32 @@ Different topic content.
     assert any("Different topic content." in t for t in by_section[second_id])
     assert not any("Different topic content." in t for t in by_section[first_id])
     assert not any("Original topic content." in t for t in by_section[second_id])
+
+
+def test_chunker_uses_pagebreak_markers_for_page_mapping() -> None:
+    doc = Document(
+        id="d2",
+        title="t",
+        source_path="x.pdf",  # type: ignore[arg-type]
+        pages=[Page(number=i, text="") for i in range(1, 6)],
+        sections=[],
+    )
+    md = """# Intro
+
+Page one content.
+
+<!-- PageBreak -->
+
+# Benchmarks
+
+English language understanding (SuperGLUE) appears on this page.
+"""
+    chunker = SemanticChunker(target_chars=200, max_chars=400)
+    sections, chunks = chunker.chunk(doc, md)
+    benchmark_section = next(s for s in sections if s.title == "Benchmarks")
+    benchmark_chunks = [c for c in chunks if c.section_id == benchmark_section.id]
+
+    assert benchmark_section.page_start == 2
+    assert benchmark_section.page_end == 2
+    assert benchmark_chunks
+    assert all(c.page_start == 2 and c.page_end == 2 for c in benchmark_chunks)

@@ -13,6 +13,12 @@ from knowledge_extraction.tui.events import EventBus, PipelineEvent
 log = logging.getLogger(__name__)
 
 StageFn = Callable[[], Awaitable[None]]
+_STAGE_EMOJI = {
+    "render": "🖼️",
+    "figures": "📊",
+    "extract": "🧠",
+    "graph": "🕸️",
+}
 
 
 @dataclass(slots=True)
@@ -38,17 +44,25 @@ class Orchestrator:
         completed: set[str] = set()
         with bound(document_id=self._document_id):
             for stage in self._stages:
+                emoji = _STAGE_EMOJI.get(stage.name, "🔹")
                 missing = [d for d in stage.deps if d not in completed]
                 if missing:
                     log.warning("stage waiting on dependencies",
                                 extra={"stage": stage.name, "missing": missing})
 
                 if resume and self._checkpoints.is_complete(self._document_id, stage.name):
-                    log.info("stage skipped (checkpointed)", extra={"stage": stage.name, "skipped": True})
+                    log.info(
+                        "%s stage.%s skipped (checkpointed); use --redo-stage %s to re-run",
+                        emoji,
+                        stage.name,
+                        stage.name,
+                        extra={"stage": stage.name, "skipped": True},
+                    )
                     self._bus.publish(PipelineEvent(stage.name, "end", {"resumed": True}))
                     completed.add(stage.name)
                     continue
 
+                log.info("%s stage.%s start", emoji, stage.name, extra={"stage": stage.name, "status": "start"})
                 self._bus.publish(PipelineEvent(stage.name, "start"))
                 try:
                     with stage_event(stage.name) as ev, span(f"stage.{stage.name}",
@@ -56,9 +70,22 @@ class Orchestrator:
                         await stage.fn()
                         ev["completed"] = True
                     self._checkpoints.mark_complete(self._document_id, stage.name)
+                    log.info(
+                        "%s stage.%s complete",
+                        emoji,
+                        stage.name,
+                        extra={"stage": stage.name, "status": "complete"},
+                    )
                     self._bus.publish(PipelineEvent(stage.name, "end"))
                     completed.add(stage.name)
                 except Exception as exc:
                     self._checkpoints.mark_failed(self._document_id, stage.name, str(exc))
+                    log.error(
+                        "%s stage.%s failed: %s",
+                        emoji,
+                        stage.name,
+                        exc,
+                        extra={"stage": stage.name, "status": "error"},
+                    )
                     self._bus.publish(PipelineEvent(stage.name, "failure", {"error": str(exc)}))
                     raise

@@ -87,8 +87,16 @@ def test_figure_pipeline_crops_and_persists(tmp_path: Path) -> None:
         "page_start": 1,
         "page_end": 1,
     }
+    other_chunk = {
+        "id": "chunk-other",
+        "document_id": "doc-other",
+        "section_id": None,
+        "text": "Unrelated chunk",
+        "page_start": 1,
+        "page_end": 1,
+    }
     repo.save_document(document)
-    repo.save_chunks([Chunk(**chunk)])
+    repo.save_chunks([Chunk(**chunk), Chunk(**other_chunk)])
 
     pipeline = FigureInterpretationPipeline(
         vision=_StubVision(),
@@ -119,6 +127,9 @@ def test_figure_pipeline_crops_and_persists(tmp_path: Path) -> None:
         chunk_row = s.get(ChunkRow, "chunk-1")
         assert chunk_row is not None
         assert figures[0].id in orjson.loads(chunk_row.figure_refs_json or "[]")
+        other_chunk_row = s.get(ChunkRow, "chunk-other")
+        assert other_chunk_row is not None
+        assert orjson.loads(other_chunk_row.figure_refs_json or "[]") == []
 
     persisted = repo.list_figures(document.id)
     assert len(persisted) == 1
@@ -126,3 +137,74 @@ def test_figure_pipeline_crops_and_persists(tmp_path: Path) -> None:
     assert persisted[0].bounding_regions[0].page == 1
     assert persisted[0].spans[0].offset == 11
     assert persisted[0].elements == ["#/paragraphs/2"]
+
+
+def test_save_chunks_preserves_figure_refs_on_resume(tmp_path: Path) -> None:
+    """Re-saving a chunk after figures stage ran must NOT wipe figure_refs.
+
+    Regression test: the chunker has no figure knowledge so chunk.figure_refs
+    is always []. Without this guard, a resume run (which re-saves chunks
+    upstream of the checkpointed figures stage) would silently clear the
+    figure linkage.
+    """
+    settings = get_settings()
+    settings.sqlite_path = tmp_path / "ke.db"
+    settings.ensure_dirs()
+    engine = make_engine(settings.sqlite_path)
+    sf = make_session_factory(engine)
+    repo = RelationalRepository(sf)
+
+    chunk_kwargs = dict(
+        id="chunk-x",
+        document_id="doc-x",
+        section_id=None,
+        text="some text",
+        page_start=1,
+        page_end=1,
+    )
+    repo.save_chunks([Chunk(**chunk_kwargs)])
+    repo.update_chunk_figure_refs("chunk-x", ["fig-1", "fig-2"])
+
+    # Simulate a resume: chunker re-emits the same chunk with figure_refs=[].
+    repo.save_chunks([Chunk(**chunk_kwargs)])
+
+    with sf() as s:
+        row = s.get(ChunkRow, "chunk-x")
+        assert row is not None
+        assert orjson.loads(row.figure_refs_json) == ["fig-1", "fig-2"]
+
+
+def test_relink_chunks_to_figures_attaches_by_page(tmp_path: Path) -> None:
+    """relink_chunks_to_figures recovers linkage purely from page ranges."""
+    settings = get_settings()
+    settings.sqlite_path = tmp_path / "ke.db"
+    settings.ensure_dirs()
+    engine = make_engine(settings.sqlite_path)
+    sf = make_session_factory(engine)
+    repo = RelationalRepository(sf)
+
+    repo.save_chunks([
+        Chunk(id="c-93-94", document_id="d", section_id=None, text="t",
+              page_start=93, page_end=94),
+        Chunk(id="c-100", document_id="d", section_id=None, text="t",
+              page_start=100, page_end=100),
+    ])
+    with sf() as s, s.begin():
+        s.add(FigureRow(id="f-94", document_id="d", page=94))
+        s.add(FigureRow(id="f-93", document_id="d", page=93))
+        s.add(FigureRow(id="f-other-doc", document_id="other", page=94))
+
+    changed = repo.relink_chunks_to_figures("d")
+    assert changed == 1  # only the page-93-94 chunk gets refs
+
+    with sf() as s:
+        row = s.get(ChunkRow, "c-93-94")
+        assert row is not None
+        refs = orjson.loads(row.figure_refs_json)
+        assert set(refs) == {"f-93", "f-94"}
+        row100 = s.get(ChunkRow, "c-100")
+        assert row100 is not None
+        assert orjson.loads(row100.figure_refs_json) == []  # no figs on page 100
+
+    # Second call is idempotent (no row changed).
+    assert repo.relink_chunks_to_figures("d") == 0

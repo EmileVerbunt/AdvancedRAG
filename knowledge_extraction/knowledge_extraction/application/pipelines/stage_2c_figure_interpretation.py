@@ -93,7 +93,7 @@ class FigureInterpretationPipeline:
 
             if figures:
                 self._repo.save_figures(figures, interpretations, model=self._model)
-                for chunk in self._repo.list_chunks():
+                for chunk in self._repo.list_chunks(document.id):
                     refs = [fid for page in range(chunk.page_start, chunk.page_end + 1) for fid in page_refs.get(page, [])]
                     if refs:
                         self._repo.update_chunk_figure_refs(chunk.id, refs)

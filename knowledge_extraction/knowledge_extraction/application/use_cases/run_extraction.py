@@ -132,16 +132,26 @@ class RunExtractionUseCase:
         pages_dir = work_dir / "pages"
         work_dir.mkdir(parents=True, exist_ok=True)
 
+        log.info("🚀 stage.bootstrap mode=%s pdf=%s", request.mode.value, request.pdf.name)
         source_pdf = self._maybe_slice(request.pdf, request.pages_limit, work_dir)
+        log.info("📥 stage.ingest start source=%s", source_pdf.name)
         document = await self._ingest(source_pdf, work_dir)
         svc.relational.save_document(document)
         bind(document_id=document.id)
+        log.info("📥 stage.ingest complete document_id=%s pages=%d", document.id, document.page_count)
 
         if request.redo_stage:
             self._cascade_redo(document.id, request.mode, parse_stage(request.redo_stage))
 
+        log.info("✂️ stage.chunk.semantic start")
         chunks = self._chunk(document, work_dir)
         svc.relational.save_chunks(chunks)
+        # Restore figure linkage on resume runs (the chunker has no figure knowledge,
+        # so re-saving chunks always sets figure_refs=[]; this is a no-op on first run).
+        relinked = svc.relational.relink_chunks_to_figures(document.id)
+        if relinked:
+            log.info("🔗 stage.chunk.semantic relinked %d chunks to figures", relinked)
+        log.info("✂️ stage.chunk.semantic complete chunks=%d", len(chunks))
 
         # Active ontology drives both schema-governed extraction and graph tagging.
         version, schema = svc.onto_service.active(request.ontology_version)
@@ -163,7 +173,7 @@ class RunExtractionUseCase:
         async def stage_figures() -> None:
             nonlocal figures, chunks
             figures = await figures_pipeline.run(document, pages_dir, work_dir / "figures")
-            chunks = svc.relational.list_chunks()
+            chunks = svc.relational.list_chunks(document.id)
             svc.bus.publish(PipelineEvent("figures", "metric", {"figures_extracted": len(figures)}))
 
         if request.mode is ExtractionMode.GOVERNED:
@@ -191,7 +201,10 @@ class RunExtractionUseCase:
 
             async def stage_graph() -> None:
                 if not results:
-                    log.info("graph stage skipped: no extraction results in this run")
+                    log.info(
+                        "🕸️ stage.graph skipped: no extraction results in this run "
+                        "(use --redo-stage extract after fixing upstream auth/config)"
+                    )
                     return
                 stats = graph_pipeline.build(results)
                 tag = version.version
@@ -199,6 +212,11 @@ class RunExtractionUseCase:
                 svc.graph_store.export_graphml(out / f"{document.id}.{tag}.graphml")
                 svc.graph_store.export_jsonld(out / f"{document.id}.{tag}.jsonld")
                 svc.graph_store.export_cypher(out / f"{document.id}.{tag}.cypher")
+                log.info(
+                    "🕸️ stage.graph complete nodes=%s edges=%s (no LLM calls in graph export; tokens=0 expected)",
+                    stats.get("nodes", 0),
+                    stats.get("edges", 0),
+                )
                 svc.bus.publish(PipelineEvent("graph", "metric", {**stats, "ontology_version": tag}))
         else:
             discovery = DiscoveryExtractionPipeline(

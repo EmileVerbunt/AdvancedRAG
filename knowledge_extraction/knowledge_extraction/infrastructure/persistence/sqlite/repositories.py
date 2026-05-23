@@ -218,8 +218,14 @@ class RelationalRepository:
                     row.text = c.text
                     row.page_start = c.page_start
                     row.page_end = c.page_end
-                    row.figure_refs_json = figure_refs_json
-                    row.table_refs_json = table_refs_json
+                    # Preserve previously-attached figure/table refs when the incoming chunk
+                    # has none (the semantic chunker never sets figure_refs; it relies on the
+                    # figures stage to fill them in). Otherwise re-saving chunks on resume
+                    # would silently wipe the linkage produced by the figures stage.
+                    if c.figure_refs:
+                        row.figure_refs_json = figure_refs_json
+                    if c.table_refs:
+                        row.table_refs_json = table_refs_json
                     row.token_estimate = c.token_estimate
 
     def update_chunk_figure_refs(self, chunk_id: str, figure_refs: list[str]) -> None:
@@ -227,6 +233,45 @@ class RelationalRepository:
             row = s.get(ChunkRow, chunk_id)
             if row is not None:
                 row.figure_refs_json = orjson.dumps(figure_refs).decode("utf-8")
+
+    def relink_chunks_to_figures(self, document_id: str) -> int:
+        """Recompute chunk→figure references from page ranges. Idempotent.
+
+        Used to restore the linkage produced by the figures stage when chunks are
+        re-saved on a later resume (the chunker has no figure knowledge, so it
+        defaults figure_refs to []). Safe no-op when the document has no figures.
+
+        Returns the number of chunks whose figure_refs_json was changed.
+        """
+        with self._sf() as s, s.begin():
+            figure_rows = s.execute(
+                select(FigureRow.id, FigureRow.page).where(FigureRow.document_id == document_id)
+            ).all()
+            if not figure_rows:
+                return 0
+            page_refs: dict[int, list[str]] = {}
+            for fid, page in figure_rows:
+                if page is None:
+                    continue
+                page_refs.setdefault(int(page), []).append(str(fid))
+
+            changed = 0
+            chunk_rows = s.execute(
+                select(ChunkRow).where(ChunkRow.document_id == document_id)
+            ).scalars().all()
+            for row in chunk_rows:
+                refs = [
+                    fid
+                    for page in range(row.page_start, row.page_end + 1)
+                    for fid in page_refs.get(page, [])
+                ]
+                if not refs:
+                    continue
+                new_json = orjson.dumps(refs).decode("utf-8")
+                if row.figure_refs_json != new_json:
+                    row.figure_refs_json = new_json
+                    changed += 1
+            return changed
 
     def save_extraction(self, chunk: Chunk, result: ExtractionResult) -> None:
         with self._sf() as s, s.begin():
@@ -386,9 +431,12 @@ class RelationalRepository:
                 "claims": s.query(ClaimRow).count(),
             }
 
-    def list_chunks(self) -> list[Chunk]:
+    def list_chunks(self, document_id: str | None = None) -> list[Chunk]:
         with self._sf() as s:
-            rows = s.execute(select(ChunkRow)).scalars().all()
+            stmt = select(ChunkRow)
+            if document_id is not None:
+                stmt = stmt.where(ChunkRow.document_id == document_id)
+            rows = s.execute(stmt.order_by(ChunkRow.id)).scalars().all()
             return [
                 Chunk(
                     id=r.id,

@@ -59,7 +59,7 @@ The `Orchestrator` resolves stage DAG and skips completed stages on resume. Use 
 - **Stage-level**: file-based `.done` markers under `work/checkpoints/<doc_id>/<stage>/`.
 - **Chunk-level**: SQLite table `chunk_extractions` records expected relationship/claim counts per chunk so a partial extract resume only re-processes incomplete chunks (graph build still gets a full hydrated result set).
 - **Schema migration**: `make_engine()` runs lightweight `ALTER TABLE` patches for legacy DBs (no Alembic).
-- **Redo a stage**: `ke extract <pdf> --redo-stage extract` clears extract + graph and re-runs.
+- **Redo a stage**: `ke ingest <pdf> --redo-stage extract` clears extract + graph and re-runs.
 - **Forensics**: every run writes a JSONL file under `work/logs/run-*.jsonl` containing every wide event and heartbeat — stalls leave a clear breadcrumb trail.
 
 ## Ontology Governance
@@ -78,8 +78,8 @@ Subsystem under `application/services/ontology_governance.py` + SQLite tables:
 CLI:
 
 ```
-ke ontology list | show | diff | propose | approve | reject | migrate
-ke extract --mode discovery|governed [--redo-stage STAGE] [--fresh]
+ke ingest [pdf] --mode discovery|governed [--redo-stage STAGE] [--fresh]
+ke webui [--backend lazy|mini|ms]
 ```
 
 ## Persistence
@@ -113,4 +113,4 @@ Common panels: stage + per-stage progress, token/cost metrics, failure queue.
 
 - GraphRAG indexes are tagged with the `OntologyVersion` active at index time.
 - Retrieval supports type/relationship filters and claim→evidence traversal.
-- Migrations require reindex (`ke graphrag reindex --from-version vX`).
+- Ontology migrations require rebuilding downstream retrieval indexes.

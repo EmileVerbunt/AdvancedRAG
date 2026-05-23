@@ -91,10 +91,19 @@ class GraphRagRunner:
         #    fallback (see config/graphrag_prompts/local_search_system_prompt.txt).
         self._overlay_custom_prompts(wd)
 
-        # 4) Write .env with API key. graphrag 2.7 requires api_key auth for chat models,
-        #    so in CREDENTIAL mode we fetch a short-lived bearer token from DefaultAzureCredential.
-        api_key = self._resolve_api_key()
-        (wd / ".env").write_text(f"GRAPHRAG_API_KEY={api_key}\n", encoding="utf-8")
+        # 4) Write .env. In KEY mode we provide GRAPHRAG_API_KEY for the templated
+        #    settings.yaml. In CREDENTIAL mode graphrag uses DefaultAzureCredential
+        #    via `auth_method: azure_managed_identity`, so we just leave a placeholder
+        #    so dotenv loading doesn't choke.
+        if self._settings.azure_auth_mode == AzureAuthMode.KEY:
+            if not self._settings.azure_openai_api_key:
+                raise RuntimeError(
+                    "AZURE_AUTH_MODE=key but AZURE_OPENAI_API_KEY is empty."
+                )
+            env_body = f"GRAPHRAG_API_KEY={self._settings.azure_openai_api_key}\n"
+        else:
+            env_body = "# AZURE_AUTH_MODE=credential — graphrag uses DefaultAzureCredential\n"
+        (wd / ".env").write_text(env_body, encoding="utf-8")
 
         # 5) Write chunk texts as input/*.txt; clear stale text inputs first.
         in_dir = wd / "input"
@@ -143,27 +152,24 @@ class GraphRagRunner:
             })
         return n
 
-    def _resolve_api_key(self) -> str:
-        """Return an Azure OpenAI API key — either the configured static key, or a
-        short-lived AAD bearer token when running in CREDENTIAL mode.
+    def _settings_auth_block(self) -> str:
+        """Return the auth fields to splice into a model entry.
 
-        graphrag 2.7 currently rejects `auth_type: azure_managed_identity` for chat
-        models, so we feed the bearer token through the api_key channel. The token
-        has a ~1h TTL — fine for a single `graphrag index` run.
+        Already indented to align with sibling fields under a model definition
+        (4 spaces). The placeholder ``__AUTH_BLOCK__`` is replaced AFTER
+        ``textwrap.dedent`` to avoid skewing common-prefix detection.
+
+        - KEY mode  : ``auth_type: api_key`` + ``api_key: ${GRAPHRAG_API_KEY}``
+        - CRED mode : ``auth_type: azure_managed_identity`` (no api_key —
+                      graphrag rejects setting both; it uses
+                      ``DefaultAzureCredential`` via the native LiteLLM path)
         """
         if self._settings.azure_auth_mode == AzureAuthMode.KEY:
-            if not self._settings.azure_openai_api_key:
-                raise RuntimeError(
-                    "AZURE_AUTH_MODE=key but AZURE_OPENAI_API_KEY is empty."
-                )
-            return self._settings.azure_openai_api_key
-
-        # CREDENTIAL mode: fetch bearer token via DefaultAzureCredential.
-        from azure.identity import DefaultAzureCredential
-
-        cred = DefaultAzureCredential()
-        token = cred.get_token("https://cognitiveservices.azure.com/.default")
-        return token.token
+            return (
+                "    auth_type: api_key\n"
+                "    api_key: ${GRAPHRAG_API_KEY}"
+            )
+        return "    auth_type: azure_managed_identity"
 
     async def _init(self, wd: Path) -> int:
         # `graphrag init` refuses if files exist; use --force to refresh prompts cleanly.
@@ -232,26 +238,16 @@ class GraphRagRunner:
     # ----------------------------------------------------------------------- #
 
     def _azure_settings_yaml(self) -> str:
-        """Render settings.yaml for graphrag 2.x.
+        """Render ``settings.yaml`` for the installed graphrag schema (2.x —
+        ``models:`` dict keyed by model name, nested ``input.storage``).
 
-        Schema reference: https://microsoft.github.io/graphrag/config/yaml/
-
-        Key 2.x conventions this method honors:
-        - `completion_models:` and `embedding_models:` are SEPARATE top-level dicts
-          (the unified `models:` block from older graphrag is gone).
-        - `auth_method:` (not `auth_type:`); `azure_deployment_name:` (not `deployment_name:`).
-        - Workflow refs use `completion_model_id:` / `embedding_model_id:`.
-        - `input_storage:` and `output_storage:` are separate top-level sections.
-        - `chunking:` (not `chunks:`).
-        - For Azure, `model_provider: azure` routes calls through litellm's
-          Azure OpenAI adapter.
-        - `vector_store.<name>.vector_size` MUST match the embedding model's
-          dimension (1536 for ada-002, 3072 for text-embedding-3-large).
-
-        graphrag 2.7 only accepts `api_key` auth for chat/embedding models.
-        In CREDENTIAL mode `_resolve_api_key` issues a short-lived AAD bearer
-        token and we pass it through the `api_key` field (~1h TTL — fine for
-        a single index run).
+        Auth mode comes from ``Settings.azure_auth_mode``:
+        - ``KEY``        : ``auth_type: api_key`` + ``${GRAPHRAG_API_KEY}``
+        - ``CREDENTIAL`` : ``auth_type: azure_managed_identity``
+                           (DefaultAzureCredential — required when the Azure
+                           resource has key auth disabled). graphrag's LiteLLM
+                           wrapper installs ``azure_ad_token_provider`` and
+                           skips the api_key channel entirely.
         """
         s = self._settings
         endpoint = s.azure_openai_endpoint.rstrip("/")
@@ -260,134 +256,159 @@ class GraphRagRunner:
         embed_model = s.azure_openai_embedding_model
         vector_size = _embedding_dimension(embed_model)
 
-        return textwrap.dedent(f"""\
+        template = textwrap.dedent(f"""\
             # Generated by knowledge_extraction.GraphRagRunner — do not edit manually.
             # Schema: graphrag 2.x (https://microsoft.github.io/graphrag/config/yaml/)
-            completion_models:
-              default_completion_model:
+            models:
+              default_chat_model:
+                type: chat
                 model_provider: azure
+            __AUTH_BLOCK__
                 model: {chat_model}
-                azure_deployment_name: {chat_model}
+                deployment_name: {chat_model}
                 api_base: {endpoint}
                 api_version: "{api_version}"
-                auth_method: api_key
-                api_key: ${{GRAPHRAG_API_KEY}}
-                retry:
-                  type: exponential_backoff
-                  max_retries: 6
-
-            embedding_models:
+                model_supports_json: true
+                concurrent_requests: 25
+                async_mode: threaded
+                retry_strategy: exponential_backoff
+                max_retries: 6
+                max_retry_wait: 10.0
+                tokens_per_minute: null
+                requests_per_minute: null
               default_embedding_model:
+                type: embedding
                 model_provider: azure
+            __AUTH_BLOCK__
                 model: {embed_model}
-                azure_deployment_name: {embed_model}
+                deployment_name: {embed_model}
                 api_base: {endpoint}
                 api_version: "{api_version}"
-                auth_method: api_key
-                api_key: ${{GRAPHRAG_API_KEY}}
-                retry:
-                  type: exponential_backoff
-                  max_retries: 6
+                concurrent_requests: 25
+                async_mode: threaded
+                retry_strategy: exponential_backoff
+                max_retries: 6
+                max_retry_wait: 10.0
+                tokens_per_minute: null
+                requests_per_minute: null
 
             input:
-              type: text
+              storage:
+                type: file
+                base_dir: "input"
+              file_type: text
 
-            input_storage:
-              type: file
-              base_dir: "input"
-
-            chunking:
-              type: tokens
-              encoding_model: o200k_base
+            chunks:
               size: 1200
               overlap: 100
+              group_by_columns: [id]
 
-            output_storage:
+            output:
               type: file
               base_dir: "output"
 
             cache:
-              type: json
-              storage:
-                type: file
-                base_dir: "cache"
+              type: file
+              base_dir: "cache"
 
             reporting:
               type: file
               base_dir: "logs"
 
             vector_store:
-              type: lancedb
-              db_uri: output/lancedb
-              index_schema:
-                entity_description:
-                  vector_size: {vector_size}
-                community_full_content:
-                  vector_size: {vector_size}
-                text_unit_text:
-                  vector_size: {vector_size}
+              default_vector_store:
+                type: lancedb
+                db_uri: output/lancedb
+                embeddings_schema:
+                  entity.description:
+                    vector_size: {vector_size}
+                  community.full_content:
+                    vector_size: {vector_size}
+                  text_unit.text:
+                    vector_size: {vector_size}
 
             embed_text:
-              embedding_model_id: default_embedding_model
+              model_id: default_embedding_model
+              vector_store_id: default_vector_store
 
             extract_graph:
-              completion_model_id: default_completion_model
+              model_id: default_chat_model
               prompt: "prompts/extract_graph.txt"
               entity_types: [organization, person, geo, event]
               max_gleanings: 1
 
             summarize_descriptions:
-              completion_model_id: default_completion_model
+              model_id: default_chat_model
               prompt: "prompts/summarize_descriptions.txt"
               max_length: 500
 
             extract_graph_nlp:
               text_analyzer:
                 extractor_type: regex_english
+              async_mode: threaded
 
             cluster_graph:
               max_cluster_size: 10
 
             extract_claims:
               enabled: false
-              completion_model_id: default_completion_model
+              model_id: default_chat_model
               prompt: "prompts/extract_claims.txt"
               description: "Any claims or facts that could be relevant to information discovery."
               max_gleanings: 1
 
             community_reports:
-              completion_model_id: default_completion_model
+              model_id: default_chat_model
               graph_prompt: "prompts/community_report_graph.txt"
               text_prompt: "prompts/community_report_text.txt"
               max_length: 2000
               max_input_length: 8000
 
+            embed_graph:
+              enabled: false
+
+            umap:
+              enabled: false
+
             snapshots:
-              graphml: true
+              graphml: false
               embeddings: false
 
             local_search:
-              completion_model_id: default_completion_model
+              chat_model_id: default_chat_model
               embedding_model_id: default_embedding_model
               prompt: "prompts/local_search_system_prompt.txt"
 
             global_search:
-              completion_model_id: default_completion_model
+              chat_model_id: default_chat_model
               map_prompt: "prompts/global_search_map_system_prompt.txt"
               reduce_prompt: "prompts/global_search_reduce_system_prompt.txt"
               knowledge_prompt: "prompts/global_search_knowledge_system_prompt.txt"
 
             drift_search:
-              completion_model_id: default_completion_model
+              chat_model_id: default_chat_model
               embedding_model_id: default_embedding_model
               prompt: "prompts/drift_search_system_prompt.txt"
               reduce_prompt: "prompts/drift_reduce_prompt.txt"
 
             basic_search:
-              completion_model_id: default_completion_model
+              chat_model_id: default_chat_model
               embedding_model_id: default_embedding_model
               prompt: "prompts/basic_search_system_prompt.txt"
+
+            workflows:
+              - load_input_documents
+              - create_base_text_units
+              - create_final_documents
+              - extract_graph
+              - finalize_graph
+              - extract_covariates
+              - create_communities
+              - create_final_text_units
+              - create_community_reports
+              - generate_text_embeddings
         """)
+        return template.replace("__AUTH_BLOCK__", self._settings_auth_block())
 
 
 # ---------------------------------------------------------------- helpers

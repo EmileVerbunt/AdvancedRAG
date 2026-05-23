@@ -22,6 +22,8 @@ import asyncio
 import logging
 import os
 import re
+import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -35,6 +37,13 @@ QueryMethod = Literal["local", "global", "drift", "basic"]
 
 _FACTOID_LEADERS = ("when", "where", "who", "which", "what is", "what was", "what are")
 _NUMERIC_RE = re.compile(r"\b\d{2,4}(?:[.,]\d+)?%?\b")
+_REQUIRED_QUERY_PARQUETS: tuple[str, ...] = (
+    "communities.parquet",
+    "community_reports.parquet",
+    "entities.parquet",
+    "relationships.parquet",
+    "text_units.parquet",
+)
 
 
 @dataclass(slots=True)
@@ -71,7 +80,21 @@ class IndexNotFoundError(RuntimeError):
         self.workdir = workdir
         super().__init__(
             f"No graphrag index found at {workdir}. "
-            f"Run `python -m knowledge_extraction.cli.main graphrag index` first."
+            f"Run `uv run ke ingest` first (or `--build-knowledge-tree`)."
+        )
+
+
+class IndexIncompleteError(IndexNotFoundError):
+    """Raised when an index exists but required query artifacts are missing."""
+
+    def __init__(self, workdir: Path, missing_files: tuple[str, ...]) -> None:
+        self.workdir = workdir
+        self.missing_files = missing_files
+        missing = ", ".join(missing_files)
+        RuntimeError.__init__(
+            self,
+            f"GraphRAG index at {workdir} is incomplete (missing: {missing}). "
+            f"Run `uv run ke graphrag-index` (or `uv run ke ingest`) to rebuild it.",
         )
 
 
@@ -97,12 +120,12 @@ class MsGraphRagAgent:
         method: QueryMethod | None = None,
         community_level: int = 2,
         response_type: str = "Multiple Paragraphs",
-        timeout_seconds: int = 180,
+        timeout_seconds: int = 300,
     ) -> MsGraphRagAnswer:
         chosen = method or _route_method(question)
         workdir = self._latest_workdir()
-        return asyncio.run(
-            self._query(question, chosen, workdir, community_level, response_type, timeout_seconds)
+        return self._query_sync(
+            question, chosen, workdir, community_level, response_type, timeout_seconds
         )
 
     async def ask_async(
@@ -112,7 +135,7 @@ class MsGraphRagAgent:
         method: QueryMethod | None = None,
         community_level: int = 2,
         response_type: str = "Multiple Paragraphs",
-        timeout_seconds: int = 180,
+        timeout_seconds: int = 300,
     ) -> MsGraphRagAnswer:
         chosen = method or _route_method(question)
         workdir = self._latest_workdir()
@@ -125,13 +148,14 @@ class MsGraphRagAgent:
     def _latest_workdir(self) -> Path:
         if not self._root.exists():
             raise IndexNotFoundError(self._root)
-        candidates = [
-            d for d in self._root.iterdir()
-            if d.is_dir() and (d / "output").exists() and any((d / "output").glob("*.parquet"))
-        ]
-        if not candidates:
+        workdirs = [d for d in self._root.iterdir() if d.is_dir() and (d / "output").exists()]
+        if not workdirs:
             raise IndexNotFoundError(self._root)
-        return max(candidates, key=lambda p: p.stat().st_mtime)
+        ready = [d for d in workdirs if _is_query_ready_workdir(d)]
+        if ready:
+            return max(ready, key=lambda p: p.stat().st_mtime)
+        latest_partial = max(workdirs, key=lambda p: p.stat().st_mtime)
+        raise IndexIncompleteError(latest_partial, _missing_required_parquets(latest_partial))
 
     async def _query(
         self,
@@ -142,15 +166,14 @@ class MsGraphRagAgent:
         response_type: str,
         timeout_seconds: int,
     ) -> MsGraphRagAnswer:
-        loop = asyncio.get_event_loop()
-        t0 = loop.time()
+        t0 = time.perf_counter()
         cmd = [
             self._exe, "query",
             "--root", str(workdir),
             "--method", method,
             "--community-level", str(community_level),
             "--response-type", response_type,
-            question,
+            "--query", question,
         ]
         log.info("graphrag.query.start method=%s workdir=%s", method, workdir)
         # Force UTF-8 in the child so smart quotes / non-ASCII tokens survive the round-trip.
@@ -170,10 +193,68 @@ class MsGraphRagAgent:
             await proc.wait()
             raise RuntimeError(f"graphrag query timed out after {timeout_seconds}s") from None
 
-        duration_ms = int((loop.time() - t0) * 1000)
+        duration_ms = int((time.perf_counter() - t0) * 1000)
         out = out_b.decode("utf-8", "replace")
         err = err_b.decode("utf-8", "replace")
         rc = proc.returncode or 0
+        if rc != 0:
+            log.error("graphrag.query.failed rc=%s err=%s", rc, err[-2000:])
+            raise RuntimeError(f"graphrag query exited {rc}: {err[-2000:]}")
+        log.info("graphrag.query.complete method=%s duration_ms=%d", method, duration_ms)
+        return MsGraphRagAnswer(
+            question=question,
+            method=method,
+            answer=_extract_answer(out),
+            raw_output=out,
+            workdir=workdir,
+            duration_ms=duration_ms,
+            exit_code=rc,
+        )
+
+    def _query_sync(
+        self,
+        question: str,
+        method: QueryMethod,
+        workdir: Path,
+        community_level: int,
+        response_type: str,
+        timeout_seconds: int,
+    ) -> MsGraphRagAnswer:
+        """Synchronous subprocess invocation.
+
+        Avoids asyncio.run on Windows where Streamlit's ScriptRunner thread does
+        not always have a ProactorEventLoop (which is required for subprocess
+        support). subprocess.run is simpler, more robust, and produces the same
+        result for a one-shot graphrag query.
+        """
+        t0 = time.perf_counter()
+        cmd = [
+            self._exe, "query",
+            "--root", str(workdir),
+            "--method", method,
+            "--community-level", str(community_level),
+            "--response-type", response_type,
+            "--query", question,
+        ]
+        log.info("graphrag.query.start method=%s workdir=%s", method, workdir)
+        env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                env=env,
+                timeout=timeout_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"graphrag query timed out after {timeout_seconds}s"
+            ) from exc
+
+        duration_ms = int((time.perf_counter() - t0) * 1000)
+        out = result.stdout.decode("utf-8", "replace")
+        err = result.stderr.decode("utf-8", "replace")
+        rc = result.returncode or 0
         if rc != 0:
             log.error("graphrag.query.failed rc=%s err=%s", rc, err[-2000:])
             raise RuntimeError(f"graphrag query exited {rc}: {err[-2000:]}")
@@ -214,18 +295,27 @@ def _extract_answer(stdout: str) -> str:
     return stdout.strip()
 
 
+def _missing_required_parquets(workdir: Path) -> tuple[str, ...]:
+    output_dir = workdir / "output"
+    if not output_dir.exists():
+        return _REQUIRED_QUERY_PARQUETS
+    return tuple(name for name in _REQUIRED_QUERY_PARQUETS if not (output_dir / name).exists())
+
+
+def _is_query_ready_workdir(workdir: Path) -> bool:
+    return not _missing_required_parquets(workdir)
+
+
 def graphrag_index_available(settings: Settings) -> bool:
     """Best-effort check for an indexed workdir without raising."""
     root = settings.graphrag_workdir
     if not root.exists():
         return False
-    for d in root.iterdir():
-        if d.is_dir() and (d / "output").exists() and any((d / "output").glob("*.parquet")):
-            return True
-    return False
+    return any(d.is_dir() and _is_query_ready_workdir(d) for d in root.iterdir())
 
 
 __all__ = [
+    "IndexIncompleteError",
     "IndexNotFoundError",
     "MsGraphRagAgent",
     "MsGraphRagAnswer",

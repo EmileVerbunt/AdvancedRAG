@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from openai import AsyncAzureOpenAI
 from tenacity import (
     retry,
-    retry_if_exception_type,
+    retry_if_exception,
     stop_after_attempt,
     wait_exponential,
 )
@@ -51,7 +51,7 @@ class AzureFoundryLLM:
         reraise=True,
         stop=stop_after_attempt(4),
         wait=wait_exponential(min=1, max=20),
-        retry=retry_if_exception_type(Exception),
+        retry=retry_if_exception(lambda exc: _should_retry_client_exception(exc)),
     )
     async def complete_json(
         self,
@@ -139,3 +139,11 @@ def _extract_json(text: str) -> str:
     if start != -1 and end != -1 and end > start:
         return s[start : end + 1]
     return s or "{}"
+
+
+def _should_retry_client_exception(exc: Exception) -> bool:
+    from openai import BadRequestError
+
+    # BadRequest (4xx) should be handled by higher-level policy-aware logic;
+    # retry only transient client/server issues here.
+    return not isinstance(exc, BadRequestError)

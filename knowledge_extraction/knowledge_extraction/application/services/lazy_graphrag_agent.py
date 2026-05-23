@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -151,8 +152,7 @@ class LazyGraphRagAgent:
         max_relationships: int = 40,
         max_claims: int = 20,
     ) -> LazyGraphRagAnswer:
-        loop = asyncio.get_event_loop()
-        t0 = loop.time()
+        t0 = time.perf_counter()
         with wide_event(
             "lazy.ask",
             question=question[:160],
@@ -167,7 +167,7 @@ class LazyGraphRagAgent:
                     answer="No relevant chunks were retrieved from the knowledge store.",
                     chunks=[],
                     subgraph=LazySubgraph(),
-                    duration_ms=int((loop.time() - t0) * 1000),
+                    duration_ms=int((time.perf_counter() - t0) * 1000),
                     tokens=LazyTokenUsage(),
                     model=self._model,
                 )
@@ -198,7 +198,7 @@ class LazyGraphRagAgent:
                 answer=answer,
                 chunks=chunks,
                 subgraph=subgraph,
-                duration_ms=int((loop.time() - t0) * 1000),
+                duration_ms=int((time.perf_counter() - t0) * 1000),
                 tokens=usage,
                 model=self._model,
             )

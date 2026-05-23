@@ -10,8 +10,10 @@ import json
 import logging
 import sys
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 import typer
 from rich.console import Console
@@ -47,10 +49,8 @@ from knowledge_extraction.application.use_cases.run_extraction import (
     ExtractionRequest,
     ExtractionServices,
     RunExtractionUseCase,
-    pick_first_working_ingestion,
-    slice_pdf_if_requested,
 )
-from knowledge_extraction.config.settings import ExtractionMode, get_settings
+from knowledge_extraction.config.settings import AzureAuthMode, ExtractionMode, Settings, get_settings
 from knowledge_extraction.infrastructure.checkpointing.filesystem_checkpoint_store import (
     FilesystemCheckpointStore,
 )
@@ -81,11 +81,13 @@ from knowledge_extraction.infrastructure.telemetry.observability import (
 from knowledge_extraction.infrastructure.telemetry.otel_setup import setup_otel
 from knowledge_extraction.tui.events import EventBus
 
-app = typer.Typer(no_args_is_help=True, help="Knowledge extraction & ontology governance CLI.")
+app = typer.Typer(
+    no_args_is_help=True,
+    help="Knowledge extraction & ontology governance CLI.",
+    pretty_exceptions_show_locals=False,
+)
 ontology_app = typer.Typer(help="Ontology governance.")
 graphrag_app = typer.Typer(help="Microsoft GraphRAG integration.")
-app.add_typer(ontology_app, name="ontology")
-app.add_typer(graphrag_app, name="graphrag")
 
 # Force UTF-8 on stdout/stderr so Rich + plain prints can render answers containing
 # smart quotes, em-dashes, accented characters, etc. on Windows consoles (cp1252 default).
@@ -101,6 +103,19 @@ console = Console()
 def _bootstrap() -> tuple:
     import atexit
     import time as _time
+
+    class _RunErrorFlagFilter(logging.Filter):
+        def __init__(self, seen: dict[str, bool]) -> None:
+            super().__init__()
+            self._seen = seen
+
+        def filter(self, record: logging.LogRecord) -> bool:
+            if record.levelno >= logging.ERROR:
+                event = str(getattr(record, "event", "") or "").strip()
+                # These may be transient and recovered by higher-level retries.
+                if event not in {"llm.complete_json", "extract.chunk"}:
+                    self._seen["error"] = True
+            return True
 
     settings = get_settings()
     settings.ensure_dirs()
@@ -127,6 +142,12 @@ def _bootstrap() -> tuple:
     started_wall = _time.time()
     started_perf = _time.perf_counter()
     log = logging.getLogger("ke")
+    run_state = {"error": False}
+    run_error_filter = _RunErrorFlagFilter(run_state)
+    root_logger = logging.getLogger()
+    filtered_handlers = list(root_logger.handlers)
+    for handler in filtered_handlers:
+        handler.addFilter(run_error_filter)
     log.info("run.start", extra={"event": "run.start", "argv": argv,
                                  "started_at": datetime.fromtimestamp(started_wall, UTC).isoformat()})
 
@@ -139,13 +160,16 @@ def _bootstrap() -> tuple:
         log.info("run.finish", extra={
             "event": "run.finish",
             "duration_ms": elapsed_ms,
-            "status": "ok",
+            "status": "error" if run_state["error"] else "ok",
             "log_file": str(log_path) if log_path else None,
             "input_tokens": token_totals["input_tokens"],
             "output_tokens": token_totals["output_tokens"],
             "total_tokens": token_totals["total_tokens"],
             "models": token_totals["models"],
         })
+        for handler in filtered_handlers:
+            with contextlib.suppress(Exception):
+                handler.removeFilter(run_error_filter)
         for h in list(logging.getLogger().handlers):
             with contextlib.suppress(Exception):
                 h.flush()
@@ -175,46 +199,468 @@ _REDO_STAGE_OPT = typer.Option(
     "--redo-stage",
     help="clear checkpoint for this stage and downstream stages (render|figures|extract|graph)",
 )
+_BUILD_KNOWLEDGE_TREE_OPT = typer.Option(
+    True,
+    "--build-knowledge-tree/--no-build-knowledge-tree",
+    help="Build Microsoft GraphRAG knowledge tree after extraction (enabled by default).",
+)
 _REASON_OPT = typer.Option(..., help="rejection reason")
 _BASE_OPT = typer.Option("", help="base version")
 _EVAL_SUITE_OPT = typer.Option(
     Path("config/evals/graphrag_eval.json"),
     help="Path to GraphRAG eval suite JSON file",
 )
+_INGEST_PDF_ARG = typer.Argument(
+    None,
+    help="PDF to ingest. Defaults to ingesting all PDFs in assets/.",
+)
+
+
+@dataclass(slots=True)
+class PreflightResult:
+    status: str
+    check: str
+    detail: str
+
+
+def _is_https_url(value: str) -> bool:
+    if not value:
+        return False
+    parsed = urlparse(value)
+    return parsed.scheme.lower() == "https" and bool(parsed.netloc)
+
+
+def _collect_preflight_results(
+    settings: Settings, *, live: bool, include_graphrag: bool,
+) -> list[PreflightResult]:
+    results: list[PreflightResult] = []
+    results.extend(_check_project_layout(settings))
+    results.extend(_check_openai_config(settings))
+    results.extend(_check_document_intelligence_config(settings))
+    if settings.azure_auth_mode is AzureAuthMode.CREDENTIAL:
+        results.append(_check_default_credential_token())
+    if live:
+        results.append(_probe_openai_chat(settings))
+        results.append(_probe_openai_embeddings(settings))
+        results.append(_probe_document_intelligence(settings))
+    if include_graphrag:
+        results.append(_check_graphrag_executable(settings))
+    return results
+
+
+def _check_project_layout(settings: Settings) -> list[PreflightResult]:
+    prompts = sorted(settings.prompts_dir.glob("*.j2"))
+    prompt_status = "PASS" if prompts else "FAIL"
+    prompt_detail = (
+        f"{len(prompts)} prompt template(s) found in {settings.prompts_dir}"
+        if prompts else f"no prompt templates found in {settings.prompts_dir}"
+    )
+    ontology_ok = settings.ontology_yaml_path.exists()
+    return [
+        PreflightResult(
+            status="PASS" if ontology_ok else "FAIL",
+            check="ontology config",
+            detail=(
+                f"found {settings.ontology_yaml_path}"
+                if ontology_ok else f"missing {settings.ontology_yaml_path}"
+            ),
+        ),
+        PreflightResult(status=prompt_status, check="prompt templates", detail=prompt_detail),
+    ]
+
+
+def _check_openai_config(settings: Settings) -> list[PreflightResult]:
+    if not _is_https_url(settings.azure_openai_endpoint):
+        endpoint = PreflightResult(
+            status="FAIL",
+            check="azure openai endpoint",
+            detail="AZURE_OPENAI_ENDPOINT must be a valid https URL",
+        )
+    else:
+        endpoint = PreflightResult(
+            status="PASS",
+            check="azure openai endpoint",
+            detail=settings.azure_openai_endpoint,
+        )
+
+    key_status = "PASS"
+    key_detail = f"auth mode: {settings.azure_auth_mode.value}"
+    if settings.azure_auth_mode is AzureAuthMode.KEY and not settings.azure_openai_api_key:
+        key_status = "FAIL"
+        key_detail = "AZURE_AUTH_MODE=key but AZURE_OPENAI_API_KEY is empty"
+
+    required_models = [
+        ("reasoning model", settings.azure_openai_reasoning_model),
+        ("extraction model", settings.azure_openai_extraction_model),
+        ("vision model", settings.azure_openai_vision_model),
+        ("embedding model", settings.azure_openai_embedding_model),
+    ]
+    model_results = [
+        PreflightResult(
+            status="PASS" if model.strip() else "FAIL",
+            check=label,
+            detail=model if model.strip() else "model deployment name is empty",
+        )
+        for label, model in required_models
+    ]
+    return [endpoint, PreflightResult(status=key_status, check="azure auth", detail=key_detail), *model_results]
+
+
+def _check_document_intelligence_config(settings: Settings) -> list[PreflightResult]:
+    if not settings.azure_document_intelligence_endpoint:
+        return [
+            PreflightResult(
+                status="WARN",
+                check="document intelligence",
+                detail="not configured; ingest will fall back to Docling",
+            )
+        ]
+    endpoint_ok = _is_https_url(settings.azure_document_intelligence_endpoint)
+    endpoint = PreflightResult(
+        status="PASS" if endpoint_ok else "FAIL",
+        check="document intelligence endpoint",
+        detail=(
+            settings.azure_document_intelligence_endpoint
+            if endpoint_ok else "AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT must be a valid https URL"
+        ),
+    )
+    auth = PreflightResult(
+        status="PASS",
+        check="document intelligence auth",
+        detail=f"auth mode: {settings.azure_auth_mode.value}",
+    )
+    if settings.azure_auth_mode is AzureAuthMode.KEY and not settings.azure_document_intelligence_key:
+        auth = PreflightResult(
+            status="FAIL",
+            check="document intelligence auth",
+            detail="AZURE_AUTH_MODE=key but AZURE_DOCUMENT_INTELLIGENCE_KEY is empty",
+        )
+    return [endpoint, auth]
+
+
+def _check_default_credential_token() -> PreflightResult:
+    from azure.core.exceptions import ClientAuthenticationError
+    from azure.identity import CredentialUnavailableError, DefaultAzureCredential
+
+    cred = DefaultAzureCredential()
+    scope = "https://cognitiveservices.azure.com/.default"
+    try:
+        token = cred.get_token(scope)
+    except CredentialUnavailableError as exc:
+        return PreflightResult(
+            status="FAIL",
+            check="defaultazurecredential token",
+            detail=f"credential unavailable: {exc}",
+        )
+    except ClientAuthenticationError as exc:
+        return PreflightResult(
+            status="FAIL",
+            check="defaultazurecredential token",
+            detail=f"authentication failed: {exc}",
+        )
+    return PreflightResult(
+        status="PASS",
+        check="defaultazurecredential token",
+        detail=f"token acquired (expires_on={token.expires_on})",
+    )
+
+
+def _build_sync_openai_client(settings: Settings):
+    from openai import AzureOpenAI
+
+    if settings.azure_auth_mode is AzureAuthMode.CREDENTIAL:
+        from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+
+        credential = DefaultAzureCredential()
+        token_provider = get_bearer_token_provider(
+            credential, "https://cognitiveservices.azure.com/.default"
+        )
+        return AzureOpenAI(
+            azure_endpoint=settings.azure_openai_endpoint,
+            api_version=settings.azure_openai_api_version,
+            azure_ad_token_provider=token_provider,
+        )
+    return AzureOpenAI(
+        azure_endpoint=settings.azure_openai_endpoint,
+        api_version=settings.azure_openai_api_version,
+        api_key=settings.azure_openai_api_key,
+    )
+
+
+def _uses_max_completion_tokens(model: str) -> bool:
+    normalized = model.lower()
+    return (
+        normalized.startswith(("gpt-5", "o1", "o3", "o4"))
+        or normalized.startswith("phi-4")
+    )
+
+
+def _probe_openai_chat(settings: Settings) -> PreflightResult:
+    from openai import APIConnectionError, APIStatusError
+
+    try:
+        client = _build_sync_openai_client(settings)
+        kwargs: dict[str, object] = {
+            "model": settings.azure_openai_extraction_model,
+            "messages": [
+                {"role": "system", "content": "Return OK."},
+                {"role": "user", "content": "ping"},
+            ],
+        }
+        if _uses_max_completion_tokens(settings.azure_openai_extraction_model):
+            kwargs["max_completion_tokens"] = 8
+        else:
+            kwargs["max_tokens"] = 8
+            kwargs["temperature"] = 0.0
+        client.chat.completions.create(**kwargs)
+    except APIConnectionError as exc:
+        return PreflightResult(status="FAIL", check="openai chat probe", detail=f"connection failed: {exc}")
+    except APIStatusError as exc:
+        return PreflightResult(
+            status="FAIL",
+            check="openai chat probe",
+            detail=f"request failed: status={exc.status_code} {exc}",
+        )
+    return PreflightResult(
+        status="PASS",
+        check="openai chat probe",
+        detail=f"chat completion reachable via {settings.azure_openai_extraction_model}",
+    )
+
+
+def _probe_openai_embeddings(settings: Settings) -> PreflightResult:
+    from openai import APIConnectionError, APIStatusError
+
+    try:
+        client = _build_sync_openai_client(settings)
+        client.embeddings.create(
+            model=settings.azure_openai_embedding_model,
+            input=["preflight"],
+        )
+    except APIConnectionError as exc:
+        return PreflightResult(
+            status="FAIL",
+            check="openai embedding probe",
+            detail=f"connection failed: {exc}",
+        )
+    except APIStatusError as exc:
+        return PreflightResult(
+            status="FAIL",
+            check="openai embedding probe",
+            detail=f"request failed: status={exc.status_code} {exc}",
+        )
+    return PreflightResult(
+        status="PASS",
+        check="openai embedding probe",
+        detail=f"embedding endpoint reachable via {settings.azure_openai_embedding_model}",
+    )
+
+
+def _probe_document_intelligence(settings: Settings) -> PreflightResult:
+    if not settings.azure_document_intelligence_endpoint:
+        return PreflightResult(
+            status="WARN",
+            check="document intelligence probe",
+            detail="skipped (endpoint not configured)",
+        )
+
+    from azure.ai.documentintelligence import DocumentIntelligenceClient
+    from azure.core.exceptions import HttpResponseError, ServiceRequestError
+
+    if settings.azure_auth_mode is AzureAuthMode.CREDENTIAL:
+        from azure.identity import DefaultAzureCredential
+
+        credential = DefaultAzureCredential()
+        client = DocumentIntelligenceClient(
+            endpoint=settings.azure_document_intelligence_endpoint,
+            credential=credential,
+        )
+    else:
+        from azure.core.credentials import AzureKeyCredential
+
+        client = DocumentIntelligenceClient(
+            endpoint=settings.azure_document_intelligence_endpoint,
+            credential=AzureKeyCredential(settings.azure_document_intelligence_key),
+        )
+
+    test_pdf = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF"
+    try:
+        poller = client.begin_analyze_document("prebuilt-layout", test_pdf)
+        poller.result()
+    except ServiceRequestError as exc:
+        return PreflightResult(
+            status="FAIL",
+            check="document intelligence probe",
+            detail=f"connection failed: {exc}",
+        )
+    except HttpResponseError as exc:
+        if exc.status_code in (401, 403):
+            return PreflightResult(
+                status="FAIL",
+                check="document intelligence probe",
+                detail=f"authentication failed: status={exc.status_code}",
+            )
+        return PreflightResult(
+            status="PASS",
+            check="document intelligence probe",
+            detail=f"service reachable (status={exc.status_code}, auth accepted)",
+        )
+    return PreflightResult(
+        status="PASS",
+        check="document intelligence probe",
+        detail="service reachable and accepted probe document",
+    )
+
+
+def _check_graphrag_executable(settings: Settings) -> PreflightResult:
+    from knowledge_extraction.infrastructure.graphrag.graphrag_runner import resolve_graphrag_executable
+
+    try:
+        executable = resolve_graphrag_executable(settings)
+    except RuntimeError as exc:
+        return PreflightResult(status="FAIL", check="graphrag executable", detail=str(exc))
+    return PreflightResult(status="PASS", check="graphrag executable", detail=executable)
 
 
 @app.command()
-def ingest(pdf: Path, pages: int | None = _PAGES_OPT) -> None:
-    """Ingest a PDF (layout + page images) and persist artifacts."""
-    settings, relational, governance, onto_service = _bootstrap()
-    bus = EventBus()
-    asyncio.run(_ingest_only(settings, relational, governance, onto_service, bus, pdf, pages))
+def preflight(
+    live: bool = typer.Option(
+        True,
+        "--live/--no-live",
+        help="Run live Azure service probes (chat, embeddings, and Document Intelligence).",
+    ),
+    graphrag: bool = typer.Option(
+        False,
+        "--graphrag",
+        help="Also validate that the `graphrag` executable is discoverable.",
+    ),
+) -> None:
+    """Run quick config/auth checks before starting a heavy run."""
+    settings = get_settings()
+    settings.ensure_dirs()
+    results = _collect_preflight_results(settings, live=live, include_graphrag=graphrag)
 
+    table = Table(title="Preflight")
+    table.add_column("status")
+    table.add_column("check")
+    table.add_column("detail")
+    status_colors = {"PASS": "green", "WARN": "yellow", "FAIL": "red"}
+    for row in results:
+        color = status_colors.get(row.status, "white")
+        table.add_row(f"[{color}]{row.status}[/{color}]", row.check, row.detail)
+    console.print(table)
 
-async def _ingest_only(settings, relational, governance, onto_service, bus,
-                        pdf: Path, pages_limit: int | None = None) -> None:
-    """Ingest-only flow: slice + first-working-adapter + render. No extraction."""
-    services = _build_services(settings, relational, governance, onto_service, bus)
-    work_dir = settings.artifact_path / pdf.stem
-    work_dir.mkdir(parents=True, exist_ok=True)
-    source_pdf = slice_pdf_if_requested(pdf, pages_limit, work_dir)
-    document = await pick_first_working_ingestion(services.ingestion_chain, source_pdf, work_dir)
-    relational.save_document(document)
-    await services.renderer.render(source_pdf, work_dir / "pages", dpi=150)
-    console.print(f"[green]Ingested[/green] {pdf.name} -> {document.id} ({document.page_count} pages)")
+    failed = [r for r in results if r.status == "FAIL"]
+    warned = [r for r in results if r.status == "WARN"]
+    if failed:
+        console.print(f"[red]preflight failed: {len(failed)} check(s) failed[/red]")
+        raise typer.Exit(code=2)
+    if warned:
+        console.print(f"[yellow]preflight passed with {len(warned)} warning(s)[/yellow]")
+        raise typer.Exit(code=0)
+    console.print("[green]preflight passed[/green]")
 
 
 @app.command()
-def extract(
-    pdf: Path,
+def ingest(
+    pdf: Path | None = _INGEST_PDF_ARG,
     mode: ExtractionMode = _MODE_OPT,
     pages: int | None = _PAGES_OPT,
     ontology_version: str | None = _VERSION_OPT,
     fresh: bool = _FRESH_OPT,
     redo_stage: str | None = _REDO_STAGE_OPT,
+    build_knowledge_tree: bool = _BUILD_KNOWLEDGE_TREE_OPT,
 ) -> None:
-    """Run end-to-end ingest -> chunk -> render -> figures -> extract -> graph."""
+    """Run full extraction for one PDF or, by default, every PDF in assets/."""
     settings, relational, governance, onto_service = _bootstrap()
+    pdfs = _resolve_ingest_sources(settings, pdf)
+    asyncio.run(
+        _run_extraction_batch(
+            settings=settings,
+            relational=relational,
+            governance=governance,
+            onto_service=onto_service,
+            pdfs=pdfs,
+            mode=mode,
+            pages=pages,
+            ontology_version=ontology_version,
+            fresh=fresh,
+            redo_stage=redo_stage,
+        )
+    )
+    if build_knowledge_tree:
+        _run_ms_graphrag_index(settings=settings, relational=relational, onto_service=onto_service)
+
+
+def _resolve_ingest_sources(settings: Settings, pdf: Path | None) -> list[Path]:
+    """Resolve ingest sources; default to all PDFs in the assets directory."""
+    if pdf is not None:
+        if pdf.is_dir():
+            docs = sorted(p for p in pdf.glob("*.pdf") if p.is_file())
+            if not docs:
+                raise typer.BadParameter(f"no PDFs found in directory: {pdf}")
+            return docs
+        if not pdf.exists():
+            raise typer.BadParameter(f"file not found: {pdf}")
+        if pdf.suffix.lower() != ".pdf":
+            raise typer.BadParameter(f"expected a PDF file, got: {pdf.name}")
+        return [pdf]
+
+    assets_dir = settings.project_root / "assets"
+    if not assets_dir.exists():
+        raise typer.BadParameter(f"default assets directory not found: {assets_dir}")
+    docs = sorted(p for p in assets_dir.glob("*.pdf") if p.is_file())
+    if not docs:
+        raise typer.BadParameter(f"no PDFs found in default assets directory: {assets_dir}")
+    return docs
+
+
+async def _run_extraction_batch(
+    *,
+    settings: Settings,
+    relational: RelationalRepository,
+    governance: GovernanceRepository,
+    onto_service: OntologyService,
+    pdfs: list[Path],
+    mode: ExtractionMode | None,
+    pages: int | None,
+    ontology_version: str | None,
+    fresh: bool,
+    redo_stage: str | None,
+) -> None:
+    if len(pdfs) > 1:
+        console.print(f"[cyan]extracting {len(pdfs)} PDFs[/cyan]")
+    for idx, source_pdf in enumerate(pdfs, start=1):
+        if len(pdfs) > 1:
+            console.print(f"[cyan][{idx}/{len(pdfs)}][/cyan] {source_pdf.name}")
+        await _run_extraction_for_pdf(
+            settings=settings,
+            relational=relational,
+            governance=governance,
+            onto_service=onto_service,
+            pdf=source_pdf,
+            mode=mode,
+            pages=pages,
+            ontology_version=ontology_version,
+            fresh=fresh,
+            redo_stage=redo_stage,
+        )
+
+
+async def _run_extraction_for_pdf(
+    *,
+    settings: Settings,
+    relational: RelationalRepository,
+    governance: GovernanceRepository,
+    onto_service: OntologyService,
+    pdf: Path,
+    mode: ExtractionMode | None,
+    pages: int | None,
+    ontology_version: str | None,
+    fresh: bool,
+    redo_stage: str | None,
+) -> None:
+    """Run end-to-end extraction for a single PDF."""
     selected_mode = mode or settings.default_mode
     if redo_stage is not None:
         try:
@@ -235,8 +681,62 @@ def extract(
         resume=not fresh,
         redo_stage=redo_stage,
     )
-    asyncio.run(use_case.execute(request))
-    console.print("[green]extract complete[/green]")
+    await use_case.execute(request)
+    console.print(f"[green]extract complete[/green] {pdf.name}")
+
+
+def _run_ms_graphrag_index(
+    *,
+    settings: Settings,
+    relational: RelationalRepository,
+    onto_service: OntologyService,
+) -> None:
+    """Build the Microsoft GraphRAG index from extracted chunks."""
+    from knowledge_extraction.infrastructure.graphrag.graphrag_runner import GraphRagRunner
+
+    version = onto_service.active()[0]
+    chunks = relational.list_chunks()
+    if not chunks:
+        console.print("[yellow]No chunks in the relational store yet — run `ke ingest` first.[/yellow]")
+        raise typer.Exit(code=2)
+
+    runner = GraphRagRunner(Path("./work/graphrag"), settings)
+    with wide_event("graphrag.write_inputs", chunks=len(chunks), version=version.version):
+        runner.write_inputs(version, chunks)
+
+    log_path = runner.workdir(version) / "logs" / "indexing-engine.log"
+
+    def _probe_index_progress() -> str | None:
+        try:
+            if not log_path.exists():
+                return None
+            with log_path.open("rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - 4096))
+                tail = f.read().decode("utf-8", errors="replace")
+            for line in reversed(tail.splitlines()):
+                if "progress:" in line:
+                    return line.split(" - ")[-1].strip()
+            return None
+        except OSError:
+            return None
+
+    code = 0
+    try:
+        with wide_event(
+            "graphrag.index",
+            version=version.version,
+            progress_probe=_probe_index_progress,
+        ) as ev:
+            code = asyncio.run(runner.index(version))
+            ev["exit_code"] = code
+            if code != 0:
+                raise RuntimeError(f"graphrag index exited {code}")
+    except RuntimeError:
+        console.print(f"[red]graphrag index failed (exit {code}). Inspect logs in work/graphrag/{version.version}/logs[/red]")
+        raise typer.Exit(code=max(1, code)) from None
+    console.print(f"[green]ms index ready[/green] work\\graphrag\\{version.version}")
 
 
 def _build_services(settings, relational, governance, onto_service, bus) -> ExtractionServices:
@@ -264,14 +764,6 @@ def _build_services(settings, relational, governance, onto_service, bus) -> Extr
     )
 
 
-@app.command(name="graph")
-def graph_cmd(action: str = typer.Argument(..., help="build")) -> None:
-    """Graph utilities (build is run automatically by `extract`)."""
-    if action != "build":
-        raise typer.BadParameter("only 'build' is supported standalone (use `extract` for end-to-end)")
-    console.print("[yellow]use `ke extract <pdf>` for end-to-end build[/yellow]")
-
-
 @app.command()
 def resume(
     pdf: Path,
@@ -279,7 +771,21 @@ def resume(
     pages: int | None = _PAGES_OPT,
 ) -> None:
     """Re-run extraction; checkpointed stages are skipped."""
-    extract(pdf=pdf, mode=mode, pages=pages, ontology_version=None, fresh=False, redo_stage=None)
+    settings, relational, governance, onto_service = _bootstrap()
+    asyncio.run(
+        _run_extraction_for_pdf(
+            settings=settings,
+            relational=relational,
+            governance=governance,
+            onto_service=onto_service,
+            pdf=pdf,
+            mode=mode,
+            pages=pages,
+            ontology_version=None,
+            fresh=False,
+            redo_stage=None,
+        )
+    )
 
 
 @app.command()
@@ -378,12 +884,32 @@ def stats() -> None:
         console.print(dt)
 
 
+def _resolve_streamlit_app_path(module_name: str, file_name: str) -> Path:
+    app_path = Path(__file__).parent / file_name
+    if app_path.exists():
+        return app_path
+    import importlib.util
+
+    spec = importlib.util.find_spec(module_name)
+    if spec and spec.origin:
+        resolved = Path(spec.origin)
+        if resolved.exists():
+            return resolved
+    return app_path
+
+
 @app.command()
-def tour(
-    port: int = typer.Option(8501, help="Port for Streamlit"),
+def webui(
+    backend: str = typer.Option(
+        "lazy",
+        "--backend",
+        "-b",
+        help="Default retrieval backend for the Chat page: lazy | mini | ms.",
+    ),
+    port: int = typer.Option(8502, help="Port for Streamlit"),
     host: str = typer.Option("localhost", help="Host"),
 ) -> None:
-    """Launch the interactive Streamlit pipeline tour."""
+    """Launch unified Streamlit UI with Telemetry and Chat pages."""
     import subprocess
 
     try:
@@ -396,24 +922,30 @@ def tour(
         )
         raise typer.Exit(code=1) from None
 
-    app_path = Path(__file__).parent / "tour_app.py"
+    chosen = backend.lower().strip()
+    if chosen not in {"lazy", "mini", "ms"}:
+        raise typer.BadParameter("backend must be one of: lazy, mini, ms")
+
+    app_path = _resolve_streamlit_app_path("knowledge_extraction.cli.webui_app", "webui_app.py")
     if not app_path.exists():
-        # Fall back to importlib resolution if __file__ is stale (e.g. after
-        # an editable-install layout change).
-        import importlib.util
-        spec = importlib.util.find_spec("knowledge_extraction.cli.tour_app")
-        if spec and spec.origin:
-            app_path = Path(spec.origin)
-    if not app_path.exists():
-        console.print(f"[red]tour_app.py not found at {app_path}[/red]")
+        console.print(f"[red]{app_path.name} not found at {app_path}[/red]")
         raise typer.Exit(code=1)
+
     cmd = [
-        sys.executable, "-m", "streamlit", "run", str(app_path),
-        "--server.port", str(port),
-        "--server.address", host,
-        "--browser.gatherUsageStats", "false",
+        sys.executable,
+        "-m",
+        "streamlit",
+        "run",
+        str(app_path),
+        "--server.port",
+        str(port),
+        "--server.address",
+        host,
+        "--browser.gatherUsageStats",
+        "false",
     ]
-    console.print(f"[green]Launching tour:[/green] http://{host}:{port}")
+    cmd.extend(["--", f"--backend={chosen}"])
+    console.print(f"[green]Launching webui:[/green] http://{host}:{port}")
     subprocess.run(cmd, check=False)
 
 
@@ -501,48 +1033,8 @@ def onto_migrate(from_version: str, to_version: str) -> None:
 @graphrag_app.command("index")
 def graphrag_index() -> None:
     """Run Microsoft GraphRAG indexing on extracted artifacts."""
-    from knowledge_extraction.infrastructure.graphrag.graphrag_runner import GraphRagRunner
-
     settings, relational, _governance, onto_service = _bootstrap()
-    version = onto_service.active()[0]
-    chunks = relational.list_chunks()
-    if not chunks:
-        console.print("[yellow]No chunks in the relational store yet — run `ke extract` first.[/yellow]")
-        raise typer.Exit(code=2)
-    runner = GraphRagRunner(Path("./work/graphrag"), settings)
-    with wide_event("graphrag.write_inputs", chunks=len(chunks), version=version.version):
-        runner.write_inputs(version, chunks)
-
-    log_path = runner.workdir(version) / "logs" / "indexing-engine.log"
-
-    def _probe_index_progress() -> str | None:
-        # Tail the latest line so the heartbeat can show real progress and
-        # reset the stall timer whenever graphrag advances.
-        try:
-            if not log_path.exists():
-                return None
-            with log_path.open("rb") as f:
-                f.seek(0, 2)
-                size = f.tell()
-                f.seek(max(0, size - 4096))
-                tail = f.read().decode("utf-8", errors="replace")
-            for line in reversed(tail.splitlines()):
-                if "progress:" in line:
-                    return line.split(" - ")[-1].strip()
-            return None
-        except OSError:
-            return None
-
-    with wide_event(
-        "graphrag.index",
-        version=version.version,
-        progress_probe=_probe_index_progress,
-    ) as ev:
-        code = asyncio.run(runner.index(version))
-        ev["exit_code"] = code
-    if code != 0:
-        console.print(f"[red]graphrag index failed (exit {code}). Inspect logs in work/graphrag/{version.version}/logs[/red]")
-    raise typer.Exit(code=code)
+    _run_ms_graphrag_index(settings=settings, relational=relational, onto_service=onto_service)
 
 
 @graphrag_app.command("ask")

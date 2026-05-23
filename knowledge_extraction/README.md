@@ -12,26 +12,28 @@ Two extraction modes:
 ```bash
 cd knowledge_extraction
 uv sync
-cp .env.example .env       # fill in Azure endpoints/keys
+cp .env.example .env       # fill in Azure endpoints/auth
 uv run ke --help
+uv run ke preflight
 ```
 
 End-to-end on the bundled HAI AI Index report:
 
 ```bash
-uv run ke ingest assets/hai_ai_index_report_2025.pdf
-uv run ke extract assets/hai_ai_index_report_2025.pdf --mode governed
-uv run ke graph build
-uv run ke graphrag index
-uv run ke graphrag ask "Which table shows AI model performance on page 88?" --top-k 10
-uv run ke graphrag eval
+uv run ke ingest                          # full ingest+extract for all PDFs in assets/
+uv run ke webui --backend lazy
 uv run ke stats
 ```
 
-The `graphrag ask` command queries the indexed corpus through Microsoft GraphRAG
-by default (entity-aware `local` search and community-aware `global` search). A
-lightweight lexical `mini` backend is kept as a deterministic baseline — useful
-for offline runs, regression tests, and side-by-side eval comparisons.
+The Web UI supports retrieval backends (`lazy`, `mini`, `ms`) for side-by-side
+demo and debugging flows.
+
+`ke ingest` now builds the Microsoft GraphRAG knowledge tree by default, so
+`ms` backend works out of the box. To skip it for faster/local runs:
+
+```bash
+uv run ke ingest --no-build-knowledge-tree
+```
 
 ### Three retrieval modes
 
@@ -42,19 +44,12 @@ for offline runs, regression tests, and side-by-side eval comparisons.
 | `lazy`   | **$0 — reuses chunks from any normal ingest** | 2 LLM calls (~10–20 s) | LazyGraphRAG: JIT subgraph at query time, no graph build |
 
 ```bash
-uv run ke graphrag ask "..." --backend lazy        # LazyGraphRAG (query-time)
-uv run ke graphrag eval --backend ms,lazy,mini     # 3-way comparison
+uv run ke webui --backend lazy
 ```
 
-`--backend auto` is unchanged: prefers `ms` if an index exists, else falls back
-to `mini`. `lazy` is opt-in only (controlled benchmark mode).
-
-`graphrag eval` runs reusable retrieval eval cases from
-`config/evals/graphrag_eval.json` (includes a SuperGLUE disambiguation case:
-benchmark/model meaning vs adhesive meaning). Defaults to the `ms` backend;
-pass a comma-separated list (`mini,lazy,ms` or `mini,ms`) for side-by-side
-comparison runs. The legacy `--backend both` shorthand is still accepted as
-`mini,ms`.
+`ke webui` includes two pages in one app: **Telemetry** and **Chat**.
+For demos, switch `--backend` to compare retrieval styles (`mini`, `lazy`, `ms`)
+on the same question set in the Chat page.
 
 #### HAI 2025 benchmark (32-case suite)
 
@@ -75,11 +70,7 @@ guard in v1.1.
 Discovery run on an unfamiliar corpus:
 
 ```bash
-uv run ke extract <doc.pdf> --mode discovery
-uv run ke ontology list
-uv run ke ontology diff v1.0.0 candidate-3
-uv run ke ontology approve <proposal_id>
-uv run ke ontology migrate v1.0.0 v1.1.0
+uv run ke ingest <doc.pdf> --mode discovery
 ```
 
 ## Architecture

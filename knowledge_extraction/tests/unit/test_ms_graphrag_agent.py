@@ -8,7 +8,9 @@ from pathlib import Path
 
 import pytest
 
+from knowledge_extraction.application.services import ms_graphrag_agent as msga
 from knowledge_extraction.application.services.ms_graphrag_agent import (
+    IndexIncompleteError,
     IndexNotFoundError,
     MsGraphRagAgent,
     _extract_answer,
@@ -24,10 +26,25 @@ def _settings_with_workdir(tmp_path: Path):
     return s
 
 
-def _populate_index(workdir: Path, version: str = "v1") -> Path:
+def _populate_index(
+    workdir: Path,
+    version: str = "v1",
+    *,
+    missing_files: tuple[str, ...] = (),
+) -> Path:
     out = workdir / version / "output"
     out.mkdir(parents=True, exist_ok=True)
-    (out / "communities.parquet").write_bytes(b"placeholder-parquet")
+    required = (
+        "communities.parquet",
+        "community_reports.parquet",
+        "entities.parquet",
+        "relationships.parquet",
+        "text_units.parquet",
+    )
+    for filename in required:
+        if filename in missing_files:
+            continue
+        (out / filename).write_bytes(b"placeholder-parquet")
     return workdir / version
 
 
@@ -69,11 +86,18 @@ def test_graphrag_index_available_false_when_dir_missing(tmp_path: Path) -> None
     assert graphrag_index_available(s) is False
 
 
-def test_graphrag_index_available_true_when_parquet_present(tmp_path: Path) -> None:
+def test_graphrag_index_available_true_when_required_query_parquets_present(tmp_path: Path) -> None:
     s = _settings_with_workdir(tmp_path)
     s.graphrag_workdir.mkdir(parents=True)
     _populate_index(s.graphrag_workdir, "v1")
     assert graphrag_index_available(s) is True
+
+
+def test_graphrag_index_available_false_when_index_is_partial(tmp_path: Path) -> None:
+    s = _settings_with_workdir(tmp_path)
+    s.graphrag_workdir.mkdir(parents=True)
+    _populate_index(s.graphrag_workdir, "v1", missing_files=("community_reports.parquet",))
+    assert graphrag_index_available(s) is False
 
 
 def test_agent_raises_if_no_index(tmp_path: Path) -> None:
@@ -83,16 +107,29 @@ def test_agent_raises_if_no_index(tmp_path: Path) -> None:
         agent.ask("anything")
 
 
-def test_agent_picks_latest_index(tmp_path: Path) -> None:
+def test_agent_picks_latest_complete_index_when_newest_is_partial(tmp_path: Path) -> None:
     s = _settings_with_workdir(tmp_path)
     s.graphrag_workdir.mkdir(parents=True)
     older = _populate_index(s.graphrag_workdir, "v1")
-    newer = _populate_index(s.graphrag_workdir, "v2")
+    newer = _populate_index(
+        s.graphrag_workdir,
+        "v2",
+        missing_files=("community_reports.parquet",),
+    )
     now = time.time()
     os.utime(older, (now - 60, now - 60))
     os.utime(newer, (now, now))
     agent = MsGraphRagAgent(s, executable="dummy-graphrag")
-    assert agent._latest_workdir().name == "v2"
+    assert agent._latest_workdir().name == "v1"
+
+
+def test_agent_raises_index_incomplete_when_only_partial_index_exists(tmp_path: Path) -> None:
+    s = _settings_with_workdir(tmp_path)
+    s.graphrag_workdir.mkdir(parents=True)
+    _populate_index(s.graphrag_workdir, "v1", missing_files=("community_reports.parquet",))
+    agent = MsGraphRagAgent(s, executable="dummy-graphrag")
+    with pytest.raises(IndexIncompleteError, match="community_reports\\.parquet"):
+        agent.ask("anything")
 
 
 # -------------------------------------------------------------- subprocess mock
@@ -106,6 +143,13 @@ class _FakeProc:
         return self._out, self._err
 
 
+class _FakeCompleted:
+    def __init__(self, stdout: bytes, stderr: bytes = b"", rc: int = 0) -> None:
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = rc
+
+
 def test_agent_invokes_subprocess_and_returns_answer(tmp_path: Path, monkeypatch) -> None:
     s = _settings_with_workdir(tmp_path)
     s.graphrag_workdir.mkdir(parents=True)
@@ -113,19 +157,23 @@ def test_agent_invokes_subprocess_and_returns_answer(tmp_path: Path, monkeypatch
 
     captured: dict[str, object] = {}
 
-    async def fake_create_subprocess_exec(*args, **kwargs):
-        captured["argv"] = args
-        return _FakeProc(b"SUCCESS: Local Search Response:\nFinal answer here.", b"", 0)
+    def fake_run(cmd, **kwargs):
+        captured["argv"] = tuple(cmd)
+        captured["kwargs"] = kwargs
+        return _FakeCompleted(b"SUCCESS: Local Search Response:\nFinal answer here.", b"", 0)
 
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(msga.subprocess, "run", fake_run)
 
     agent = MsGraphRagAgent(s, executable="dummy-graphrag")
     answer = agent.ask("When was Qwen2 released?", method="local")
     assert answer.method == "local"
     assert answer.answer == "Final answer here."
     assert answer.exit_code == 0
-    assert "--method" in captured["argv"]
-    assert "local" in captured["argv"]
+    argv = captured["argv"]
+    assert "--method" in argv
+    assert "local" in argv
+    assert "--query" in argv
+    assert "When was Qwen2 released?" in argv
 
 
 def test_agent_propagates_subprocess_failure(tmp_path: Path, monkeypatch) -> None:
@@ -133,11 +181,27 @@ def test_agent_propagates_subprocess_failure(tmp_path: Path, monkeypatch) -> Non
     s.graphrag_workdir.mkdir(parents=True)
     _populate_index(s.graphrag_workdir, "v1")
 
-    async def fake_create_subprocess_exec(*args, **kwargs):
-        return _FakeProc(b"", b"boom: missing config", rc=2)
+    def fake_run(cmd, **kwargs):
+        return _FakeCompleted(b"", b"boom: missing config", rc=2)
 
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(msga.subprocess, "run", fake_run)
 
     agent = MsGraphRagAgent(s, executable="dummy-graphrag")
     with pytest.raises(RuntimeError, match="exited 2"):
         agent.ask("anything", method="local")
+
+
+def test_agent_async_path_still_works(tmp_path: Path, monkeypatch) -> None:
+    """ask_async keeps the asyncio subprocess path for non-Streamlit callers."""
+    s = _settings_with_workdir(tmp_path)
+    s.graphrag_workdir.mkdir(parents=True)
+    _populate_index(s.graphrag_workdir, "v1")
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        return _FakeProc(b"SUCCESS: Local Search Response:\nAsync answer.", b"", 0)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    agent = MsGraphRagAgent(s, executable="dummy-graphrag")
+    answer = asyncio.run(agent.ask_async("anything", method="local"))
+    assert answer.answer == "Async answer."

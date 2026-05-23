@@ -29,7 +29,8 @@ class NetworkXGraphStore:
 
         path.parent.mkdir(parents=True, exist_ok=True)
         with wide_event("graph.export", format="graphml", path=str(path),
-                        nodes=self.g.number_of_nodes(), edges=self.g.number_of_edges()) as ev:
+                        nodes=self.g.number_of_nodes(), edges=self.g.number_of_edges(),
+                        llm_used=False, token_note="graph export is local serialization") as ev:
             flat = nx.MultiDiGraph()
             for n, data in self.g.nodes(data=True):
                 flat.add_node(n, **{k: _as_str(v) for k, v in data.items()})
@@ -43,7 +44,8 @@ class NetworkXGraphStore:
 
         path.parent.mkdir(parents=True, exist_ok=True)
         with wide_event("graph.export", format="jsonld", path=str(path),
-                        nodes=self.g.number_of_nodes(), edges=self.g.number_of_edges()) as ev:
+                        nodes=self.g.number_of_nodes(), edges=self.g.number_of_edges(),
+                        llm_used=False, token_note="graph export is local serialization") as ev:
             doc = {
                 "@context": {"@vocab": "https://example.org/ke#"},
                 "@graph": [
@@ -63,7 +65,8 @@ class NetworkXGraphStore:
 
         path.parent.mkdir(parents=True, exist_ok=True)
         with wide_event("graph.export", format="cypher", path=str(path),
-                        nodes=self.g.number_of_nodes(), edges=self.g.number_of_edges()) as ev:
+                        nodes=self.g.number_of_nodes(), edges=self.g.number_of_edges(),
+                        llm_used=False, token_note="graph export is local serialization") as ev:
             lines: list[str] = []
             for n, data in self.g.nodes(data=True):
                 label = data.get("type", "Node")

@@ -34,6 +34,8 @@ log = logging.getLogger(__name__)
 @dataclass(slots=True)
 class GovernedExtractionStats:
     chunks_processed: int = 0
+    chunks_resumed: int = 0
+    chunks_failed: int = 0
     entities_accepted: int = 0
     entities_unknown: int = 0
     relationships_accepted: int = 0
@@ -59,6 +61,8 @@ class GovernedExtractionPipeline:
         schema: OntologySchema,
         model: str,
         concurrency: int = 1,
+        retryable_error_attempts: int = 5,
+        retryable_error_backoff_seconds: float = 1.0,
     ) -> None:
         self._llm = llm
         self._prompts = prompts
@@ -69,6 +73,8 @@ class GovernedExtractionPipeline:
         self._schema = schema
         self._model = model
         self._concurrency = max(1, concurrency)
+        self._retryable_error_attempts = max(1, retryable_error_attempts)
+        self._retryable_error_backoff_seconds = max(0.0, retryable_error_backoff_seconds)
         self.stats = GovernedExtractionStats()
 
     async def run(
@@ -90,6 +96,7 @@ class GovernedExtractionPipeline:
         from knowledge_extraction.infrastructure.telemetry.observability import bound, wide_event
 
         results: list[ExtractionResult | None] = [None] * len(chunks)
+        chunk_errors: list[str] = []
         total = len(chunks)
         log.info("extract.governed.start chunks=%d model=%s concurrency=%d",
                   total, self._model, self._concurrency)
@@ -111,39 +118,72 @@ class GovernedExtractionPipeline:
                 # Resume fast-path: nothing to extract, hydrate from DB.
                 if not self._repo.needs_chunk_extraction(chunk.id):
                     results[idx] = self._repo.load_extraction_for_chunk(chunk.id)
+                    self.stats.chunks_resumed += 1
                     progress.advance(task)
                     return
                 async with sem:
-                    try:
-                        with wide_event("extract.chunk",
-                                        level=logging.DEBUG,
-                                        chunk_id=chunk.id,
-                                        page_start=chunk.page_start,
-                                        page_end=chunk.page_end,
-                                        char_count=len(chunk.text)) as ev:
-                            result = await self._extract_one(doc_title, chunk, tables_by_id, figures_by_id)
-                            self._repo.save_extraction(chunk, result)
-                            results[idx] = result
-                            self.stats.chunks_processed += 1
-                            ev["entities"] = len(result.entities)
-                            ev["relationships"] = len(result.relationships)
-                            ev["claims"] = len(result.claims)
-                            ev["input_tokens"] = result.input_tokens
-                            ev["output_tokens"] = result.output_tokens
-                            ev["cached"] = result.input_tokens == 0 and result.output_tokens == 0
-                    except Exception as exc:  # tolerate per-chunk failures, continue pipeline
-                        log.error("extract.chunk.failed chunk=%s error=%s", chunk.id, exc)
-                    finally:
-                        progress.advance(task)
+                    attempt = 1
+                    while True:
+                        try:
+                            with wide_event("extract.chunk",
+                                            level=logging.DEBUG,
+                                            chunk_id=chunk.id,
+                                            page_start=chunk.page_start,
+                                            page_end=chunk.page_end,
+                                            char_count=len(chunk.text),
+                                            attempt=attempt,
+                                            max_attempts=self._retryable_error_attempts) as ev:
+                                result = await self._extract_one(doc_title, chunk, tables_by_id, figures_by_id)
+                                self._repo.save_extraction(chunk, result)
+                                results[idx] = result
+                                self.stats.chunks_processed += 1
+                                ev["entities"] = len(result.entities)
+                                ev["relationships"] = len(result.relationships)
+                                ev["claims"] = len(result.claims)
+                                ev["input_tokens"] = result.input_tokens
+                                ev["output_tokens"] = result.output_tokens
+                                ev["cached"] = result.input_tokens == 0 and result.output_tokens == 0
+                            break
+                        except Exception as exc:  # tolerate per-chunk failures, continue pipeline
+                            if _is_retryable_azure_400(exc) and attempt < self._retryable_error_attempts:
+                                backoff = min(
+                                    self._retryable_error_backoff_seconds * (2 ** (attempt - 1)),
+                                    8.0,
+                                )
+                                log.warning(
+                                    "extract.chunk.retryable chunk=%s attempt=%d/%d backoff_s=%.1f error=%s",
+                                    chunk.id,
+                                    attempt,
+                                    self._retryable_error_attempts,
+                                    backoff,
+                                    exc,
+                                )
+                                attempt += 1
+                                if backoff > 0:
+                                    await asyncio.sleep(backoff)
+                                continue
+                            self.stats.chunks_failed += 1
+                            chunk_errors.append(str(exc))
+                            log.error("extract.chunk.failed chunk=%s error=%s", chunk.id, exc)
+                            break
+                    progress.advance(task)
 
             await asyncio.gather(*(_process(i, c) for i, c in enumerate(chunks)))
 
         log.info(
-            "extract.governed.complete chunks=%d entities=%d relationships=%d",
+            "extract.governed.complete chunks=%d resumed=%d failed=%d entities=%d relationships=%d",
             self.stats.chunks_processed,
+            self.stats.chunks_resumed,
+            self.stats.chunks_failed,
             self.stats.entities_accepted,
             self.stats.relationships_accepted,
         )
+        successful = sum(1 for r in results if r is not None)
+        if total > 0 and successful == 0:
+            detail = chunk_errors[0] if chunk_errors else "unknown error"
+            raise RuntimeError(
+                f"governed extraction failed for all {total} chunks; first error: {detail}"
+            )
         # Drop slots that failed (None) — graph build only sees valid results.
         return [r for r in results if r is not None]
 
@@ -338,3 +378,10 @@ def _optional_str(value: object) -> str | None:
         return None
     parsed = str(value).strip()
     return parsed or None
+
+
+def _is_retryable_azure_400(exc: Exception) -> bool:
+    message = str(exc).lower()
+    has_400 = "error code: 400" in message or "'status': 400" in message or '"status": 400' in message
+    policy_or_filter = "content_filter" in message or "responsibleaipolicyviolation" in message
+    return has_400 and policy_or_filter
