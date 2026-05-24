@@ -451,6 +451,88 @@
     },
 
     {
+      "_doc": "DEMO-FAVORS-GRAPHRAG: Question uses ABSTRACT vocabulary ('harm to young people', 'chatbots') that does NOT appear verbatim in the source text — the source uses concrete vocabulary ('14-year-old boy', 'Sewell Setzer III', 'died by suicide'). Mini's BM25 cannot bridge that gap; only entity/community-aware GraphRAG can. Use this case to demonstrate GraphRAG ROI.",
+      "case_id": "multihop-chatbot-harm-to-young-people",
+      "question": "What real-world incidents of harm to young people from chatbots are documented in the report?",
+      "query_rewrite": "Documented real-world incidents in which AI chatbots harmed minors or teenagers; include named individuals, lawsuits, and the operator companies involved.",
+      "category": "multihop",
+      "focus_terms": ["character.ai"],
+      "positive_terms": [
+        "sewell setzer iii",
+        "character.ai",
+        "14-year-old",
+        "jennifer ann crecente",
+        "mental health crises"
+      ],
+      "min_positive_term_matches": 3,
+      "domain_terms": ["character.ai"],
+      "negative_terms": [
+        "lmsys chatbot arena",
+        "more beneficial than harmful",
+        "autonomous driving",
+        "wildbench"
+      ],
+      "expected_hit_kinds": ["chunk", "claim", "entity", "relationship"],
+      "max_hit_rank": 10,
+      "min_domain_term_matches": 1,
+      "top_k": 20
+    },
+    {
+      "_doc": "DEMO-FAVORS-GRAPHRAG: Tests entity-relationship retrieval. The question asks for *individuals* linked to Character.AI incidents; the answer requires bridging two distinct cases (Sewell Setzer + Crecente) that live in separate paragraphs but share the Character.AI entity. BM25 has no way to know which 'individuals' matter.",
+      "case_id": "relationship-character-ai-victim-bridge",
+      "question": "Which individuals are linked to incidents involving Character.AI, and how?",
+      "query_rewrite": "Named persons (victims, family members, defendants) connected to Character.AI lawsuits, impersonation incidents, or mental-health controversies — and the nature of each link.",
+      "category": "relationship",
+      "focus_terms": ["character.ai"],
+      "positive_terms": [
+        "sewell setzer iii",
+        "jennifer ann crecente",
+        "drew crecente",
+        "dany",
+        "lawsuit"
+      ],
+      "min_positive_term_matches": 2,
+      "domain_terms": ["character.ai"],
+      "negative_terms": [
+        "lmsys chatbot arena",
+        "chatbot arena leaderboard",
+        "mmlu",
+        "gpqa"
+      ],
+      "expected_hit_kinds": ["chunk", "claim", "entity", "relationship"],
+      "max_hit_rank": 10,
+      "min_domain_term_matches": 1,
+      "top_k": 25
+    },
+    {
+      "_doc": "DEMO-FAVORS-GRAPHRAG: Question uses 'impersonate' / 'deceased' / 'without family consent' — none appear in the source. Source says 'high school senior murdered ... her name and image appeared in an AI chatbot ... discovered by her father ... via a Google Alert'. Requires semantic / community-summary bridging.",
+      "case_id": "text-ai-impersonation-of-deceased-individual",
+      "question": "How has generative AI been used to impersonate a deceased individual without family consent?",
+      "query_rewrite": "Cases where generative AI systems recreated, mimicked, or impersonated a person who had died, especially without consent from surviving family members.",
+      "category": "text",
+      "focus_terms": ["crecente"],
+      "positive_terms": [
+        "jennifer ann crecente",
+        "drew crecente",
+        "character.ai",
+        "high school senior",
+        "google alert"
+      ],
+      "min_positive_term_matches": 2,
+      "domain_terms": ["character.ai"],
+      "negative_terms": [
+        "deepfake election",
+        "deepfake political",
+        "lmsys chatbot arena",
+        "more beneficial than harmful"
+      ],
+      "expected_hit_kinds": ["chunk", "claim", "entity"],
+      "max_hit_rank": 10,
+      "min_domain_term_matches": 1,
+      "top_k": 20
+    },
+
+    {
       "case_id": "paraphrase-falcon-mamba-release",
       "question": "On what date in 2024 was Falcon Mamba 7B made available?",
       "query_rewrite": null,
