@@ -51,6 +51,9 @@ tour = [
     "pandas>=2.2",
     "plotly>=5.22",
 ]
+neo4j = [
+    "neo4j>=5,<6",
+]
 
 [build-system]
 requires = ["hatchling"]

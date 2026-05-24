@@ -88,6 +88,10 @@ app = typer.Typer(
 )
 ontology_app = typer.Typer(help="Ontology governance.")
 graphrag_app = typer.Typer(help="Microsoft GraphRAG integration.")
+neo4j_app = typer.Typer(help="Neo4j visualization of the MS GraphRAG knowledge graph.")
+app.add_typer(ontology_app, name="ontology")
+app.add_typer(graphrag_app, name="graphrag")
+app.add_typer(neo4j_app, name="neo4j")
 
 # Force UTF-8 on stdout/stderr so Rich + plain prints can render answers containing
 # smart quotes, em-dashes, accented characters, etc. on Windows consoles (cp1252 default).
@@ -1549,6 +1553,176 @@ def _print_backend_comparison(runs: dict[str, list]) -> None:
 
     summary = ", ".join(f"{b}-only={n}" for b, n in exclusive_wins.items())
     console.print(f"[bold]Exclusive wins:[/bold] {summary} | all-pass={all_pass} | all-fail={all_fail}")
+
+
+# ── neo4j sub-app: visualise the MS GraphRAG knowledge graph ──────────────
+
+
+_COMPOSE_FILE = Path(__file__).resolve().parents[3] / "infrastructure" / "neo4j" / "docker-compose.yml"
+
+_NEO4J_OUTPUT_DIR_OPT = typer.Option(
+    None,
+    "--output-dir",
+    help="MS GraphRAG output dir (defaults to the latest under work/graphrag/).",
+)
+
+
+def _neo4j_default_output_dir(settings) -> Path:
+    """Locate the most recent MS GraphRAG output directory.
+
+    MS GraphRAG writes per-version subdirs under ``graphrag_workdir`` (e.g.
+    ``work/graphrag/1.0.0/output``). We pick the most-recently modified one
+    that actually contains the parquets the loader needs.
+    """
+    root = settings.graphrag_workdir
+    if not root.exists():
+        raise typer.BadParameter(
+            f"GraphRAG workdir not found at {root}. Run `ke ingest` first."
+        )
+    candidates = sorted(
+        (p for p in root.glob("*/output") if (p / "entities.parquet").exists()),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if not candidates:
+        raise typer.BadParameter(
+            f"No MS GraphRAG output (entities.parquet) found under {root}. "
+            "Run `ke ingest` first, or pass --output-dir explicitly."
+        )
+    return candidates[0]
+
+
+def _neo4j_config_from_env(uri: str, user: str, password: str):
+    from knowledge_extraction.infrastructure.neo4j.parquet_loader import Neo4jConfig
+
+    return Neo4jConfig(uri=uri, user=user, password=password)
+
+
+def _run_docker_compose(args: list[str]) -> int:
+    """Shell out to ``docker compose`` with our compose file."""
+    import subprocess
+
+    if not _COMPOSE_FILE.exists():
+        console.print(f"[red]compose file not found:[/red] {_COMPOSE_FILE}")
+        raise typer.Exit(2)
+    cmd = ["docker", "compose", "-f", str(_COMPOSE_FILE), *args]
+    console.print(f"[dim]$ {' '.join(cmd)}[/dim]")
+    try:
+        proc = subprocess.run(cmd, check=False)
+    except FileNotFoundError as exc:
+        console.print(
+            f"[red]docker not found:[/red] {exc}. Install Docker Desktop and ensure "
+            "`docker compose` is on PATH."
+        )
+        raise typer.Exit(2) from exc
+    return proc.returncode
+
+
+@neo4j_app.command("up")
+def neo4j_up() -> None:
+    """Start the Neo4j container in the background. Idempotent."""
+    rc = _run_docker_compose(["up", "-d"])
+    if rc != 0:
+        raise typer.Exit(rc)
+    console.print(
+        "[green]Neo4j is starting.[/green] Browser: http://localhost:7474  "
+        "(neo4j / graphrag-demo). Allow ~30s on first run."
+    )
+
+
+@neo4j_app.command("down")
+def neo4j_down(
+    volumes: bool = typer.Option(
+        False, "--volumes", help="Also drop the persistent volume (deletes loaded data)."
+    ),
+) -> None:
+    """Stop the Neo4j container."""
+    args = ["down"]
+    if volumes:
+        args.append("-v")
+    rc = _run_docker_compose(args)
+    if rc != 0:
+        raise typer.Exit(rc)
+
+
+@neo4j_app.command("open")
+def neo4j_open() -> None:
+    """Open the Neo4j Browser in the system browser."""
+    import webbrowser
+
+    url = "http://localhost:7474"
+    console.print(f"Opening {url} ...")
+    webbrowser.open(url)
+
+
+@neo4j_app.command("load")
+def neo4j_load(
+    output_dir: Path = _NEO4J_OUTPUT_DIR_OPT,
+    uri: str = typer.Option("bolt://localhost:7687", "--uri"),
+    user: str = typer.Option("neo4j", "--user"),
+    password: str = typer.Option("graphrag-demo", "--password"),
+    wipe: bool = typer.Option(False, "--wipe", help="DETACH DELETE everything first."),
+    text_units: bool = typer.Option(
+        True,
+        "--text-units/--no-text-units",
+        help="Also load text_units and MENTIONED_IN edges (lets you trace entities to source paragraphs).",
+    ),
+    batch_size: int = typer.Option(1000, "--batch-size"),
+) -> None:
+    """Load MS GraphRAG parquets into the running Neo4j container."""
+    from knowledge_extraction.infrastructure.neo4j.parquet_loader import GraphRagNeo4jLoader
+
+    settings = get_settings()
+    out_dir = output_dir or _neo4j_default_output_dir(settings)
+    console.print(f"Loading from [bold]{out_dir}[/bold] into [bold]{uri}[/bold] ...")
+
+    loader = GraphRagNeo4jLoader(
+        output_dir=out_dir, config=_neo4j_config_from_env(uri, user, password)
+    )
+    try:
+        stats = loader.load(wipe=wipe, load_text_units=text_units, batch_size=batch_size)
+    except (RuntimeError, FileNotFoundError) as exc:
+        console.print(f"[red]load failed:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    table = Table(title="Neo4j load complete", show_header=True, header_style="bold cyan")
+    table.add_column("counter", style="cyan")
+    table.add_column("count", justify="right")
+    for k, v in stats.as_dict().items():
+        table.add_row(k, str(v))
+    console.print(table)
+    console.print(
+        "[green]Done.[/green] Try [bold]ke neo4j open[/bold] and paste from "
+        "[bold]infrastructure/neo4j/demo_queries.cypher[/bold]."
+    )
+
+
+@neo4j_app.command("wipe")
+def neo4j_wipe(
+    uri: str = typer.Option("bolt://localhost:7687", "--uri"),
+    user: str = typer.Option("neo4j", "--user"),
+    password: str = typer.Option("graphrag-demo", "--password"),
+    confirm: bool = typer.Option(
+        False, "--yes", "-y", help="Skip the confirmation prompt."
+    ),
+) -> None:
+    """DETACH DELETE every node in the configured database. Irreversible."""
+    from knowledge_extraction.infrastructure.neo4j.parquet_loader import GraphRagNeo4jLoader
+
+    if not confirm and not typer.confirm(
+        f"This will DELETE all nodes in Neo4j at {uri}. Continue?"
+    ):
+        raise typer.Exit(0)
+    loader = GraphRagNeo4jLoader(
+        output_dir=Path("."),  # not used by wipe
+        config=_neo4j_config_from_env(uri, user, password),
+    )
+    try:
+        loader.wipe()
+    except RuntimeError as exc:
+        console.print(f"[red]wipe failed:[/red] {exc}")
+        raise typer.Exit(1) from exc
+    console.print("[green]Database wiped.[/green]")
 
 
 if __name__ == "__main__":

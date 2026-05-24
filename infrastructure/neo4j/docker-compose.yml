@@ -1,0 +1,58 @@
+# Neo4j 5 Community + APOC + GDS for visualizing the MS GraphRAG knowledge graph.
+#
+# Brought up for demo use only — the base pipeline does NOT depend on it.
+#
+# Usage (from repo root):
+#   docker compose -f infrastructure/neo4j/docker-compose.yml up -d
+#   uv run ke neo4j load
+#   uv run ke neo4j open
+#
+# Browser: http://localhost:7474   (auth: neo4j / graphrag-demo by default)
+# Bolt:    bolt://localhost:7687
+#
+# Override the password by exporting NEO4J_PASSWORD before `up`, or by copying
+# .env.example -> .env and editing it (docker compose auto-loads .env).
+
+services:
+  neo4j:
+    image: neo4j:5.24-community
+    container_name: graphrag-neo4j
+    restart: unless-stopped
+    ports:
+      - "7474:7474"   # HTTP / Browser
+      - "7687:7687"   # Bolt
+    environment:
+      # Auth — default password is intentionally weak; override for anything
+      # other than a local demo.
+      NEO4J_AUTH: "${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-graphrag-demo}"
+      # Plugins: APOC for graph utilities (path expansion, JSON), GDS for
+      # centrality / community-detection demos. Both are free for single-
+      # instance use.
+      NEO4J_PLUGINS: '["apoc", "graph-data-science"]'
+      # Allow procedures from APOC + GDS at runtime.
+      NEO4J_dbms_security_procedures_unrestricted: "apoc.*,gds.*"
+      NEO4J_dbms_security_procedures_allowlist: "apoc.*,gds.*"
+      # Memory tuning suitable for the ~8.6k entities + 21.7k edges in our
+      # current parquet outputs. Comfortable on a laptop with 8+ GB free.
+      NEO4J_server_memory_heap_initial__size: "1G"
+      NEO4J_server_memory_heap_max__size: "2G"
+      NEO4J_server_memory_pagecache_size: "1G"
+    volumes:
+      - graphrag-neo4j-data:/data
+      - graphrag-neo4j-logs:/logs
+      - graphrag-neo4j-plugins:/plugins
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          wget -qO- --tries=1 --timeout=2
+          http://localhost:7474 >/dev/null 2>&1 || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+volumes:
+  graphrag-neo4j-data:
+  graphrag-neo4j-logs:
+  graphrag-neo4j-plugins:

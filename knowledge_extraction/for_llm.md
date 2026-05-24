@@ -736,6 +736,7 @@ knowledge_extraction/
 │   │   │   ├── graph/networkx_store.py
 │   │   │   └── checkpoints.py
 │   │   ├── graphrag/graphrag_runner.py
+│   │   ├── neo4j/parquet_loader.py   # MS GraphRAG parquets → Neo4j (demo-only)
 │   │   └── telemetry/observability.py
 │   ├── cli/
 │   │   ├── main.py                   # composition root + Typer commands
@@ -747,8 +748,91 @@ knowledge_extraction/
 │   ├── prompts/<name>/<version>.{system,user}.txt
 │   ├── graphrag_prompts/*.txt        # overlay templates for `graphrag init`
 │   └── evals/graphrag_eval.json
+├── infrastructure/neo4j/             # Docker stack + Cypher demo queries
+│   ├── docker-compose.yml
+│   ├── .env.example
+│   └── demo_queries.cypher
 ├── tests/{unit,integration}/
 ├── work/                             # all runtime artifacts (gitignored)
 ├── architecture.md                   # high-level human-oriented overview
 └── for_llm.md                        # this document
 ```
+
+## 15. Neo4j visualization layer (demo-only, opt-in)
+
+**Purpose.** MS GraphRAG produces parquet files + LLM answers — the underlying
+knowledge graph is invisible. For demos and ad-hoc analysis we ship an
+optional Neo4j stack so you can SEE the graph: entities, relationships,
+communities, and the actual paths GraphRAG traverses to answer multi-hop
+questions (the killer demo is the Character.AI → Setzer ↔ Crecente subgraph,
+which lexical retrieval cannot reach in any number of hops).
+
+**Surface area** (zero impact on the base pipeline):
+
+| Component | Path | Notes |
+|---|---|---|
+| Docker stack | `infrastructure/neo4j/docker-compose.yml` | Neo4j `5.24-community` + APOC + GDS plugins, persistent volumes, healthcheck, ports `7474` (Browser) / `7687` (Bolt). Default password `graphrag-demo` (override via `.env`). |
+| Demo queries | `infrastructure/neo4j/demo_queries.cypher` | 9 ready-to-paste Cypher queries (Character.AI neighborhood, shortest path Setzer↔Crecente, community 193, cross-community bridges, GDS PageRank, text-unit lookup). |
+| Loader | `knowledge_extraction/infrastructure/neo4j/parquet_loader.py` | Pure-Python payload builders (`build_*_payload`) + `GraphRagNeo4jLoader` driver façade. Idempotent `MERGE`-based Cypher batched via `UNWIND` (default 1000 rows / batch). Numpy/pandas scalars coerced via `_safe()`. |
+| CLI | `ke neo4j {up,down,open,load,wipe}` in `cli/main.py` | `up`/`down` shell out to `docker compose`; `load` walks the latest `work/graphrag/<ver>/output/` and pushes parquets; `open` launches the browser; `wipe` truncates all nodes/relationships without dropping constraints. |
+| Tests | `tests/unit/test_neo4j_loader.py` | 10 tests, all pure-Python (no live DB) — payload shapes, numpy coercion, truncation, hierarchy edges. |
+| Extras | `pyproject.toml` → `[project.optional-dependencies] neo4j = ["neo4j>=5,<6"]` | `uv sync --extra neo4j` to install the driver — kept out of the base install. |
+
+**Graph schema written to Neo4j.**
+
+```cypher
+// Constraints (created on first load)
+CREATE CONSTRAINT entity_title    IF NOT EXISTS FOR (e:Entity)    REQUIRE e.title IS UNIQUE;
+CREATE CONSTRAINT entity_id       IF NOT EXISTS FOR (e:Entity)    REQUIRE e.id IS UNIQUE;
+CREATE CONSTRAINT community_id    IF NOT EXISTS FOR (c:Community) REQUIRE c.community IS UNIQUE;
+CREATE CONSTRAINT text_unit_id    IF NOT EXISTS FOR (t:TextUnit)  REQUIRE t.id IS UNIQUE;
+
+// Nodes
+(:Entity    {id, human_id, title, type, description, frequency, degree})
+(:Community {community, level, parent_id, title, size, summary, rating, rank, full_content})
+(:TextUnit  {id, human_id, n_tokens})
+
+// Edges
+(:Entity)-[:RELATED_TO {weight, description}]->(:Entity)
+(:Entity)-[:IN_COMMUNITY {level}]->(:Community)
+(:Community)-[:PARENT_OF]->(:Community)
+(:Entity)-[:MENTIONED_IN]->(:TextUnit)
+```
+
+**Loader keying — the one non-obvious detail.** MS GraphRAG's
+`relationships.parquet` stores `source` and `target` as **entity TITLES**
+(upper-cased, e.g. `"CHARACTER.AI"`), not UUIDs — so the loader `MATCH`es
+endpoints by `title`. By contrast, `text_units.parquet`'s `entity_ids` column
+contains the UUIDs, so `MENTIONED_IN` matches by `id`. Any relationship whose
+endpoint title isn't present in `entities.parquet` is counted in
+`skipped_relationships_missing_endpoint` (should be `0` for clean runs).
+
+**Lifecycle.**
+
+```bash
+uv sync --extra neo4j                  # one-time: install the driver
+uv run ke neo4j up                     # one-time: start Docker container
+uv run ke neo4j load                   # auto-detects latest work/graphrag/<ver>/output/
+uv run ke neo4j open                   # opens http://localhost:7474
+
+# When done:
+uv run ke neo4j down                   # stop container (data persisted on volume)
+uv run ke neo4j wipe                   # truncate all graph data (keeps constraints)
+```
+
+Defaults: `bolt://localhost:7687`, user `neo4j`, password `graphrag-demo`,
+database `neo4j`. Overrideable via env vars `NEO4J_URI`, `NEO4J_USER`,
+`NEO4J_PASSWORD`, `NEO4J_DATABASE` or per-command flags.
+
+**Why a separate sub-app rather than a stage.** The Neo4j layer is a
+*post-hoc visualization*, not part of the canonical pipeline. Keeping it
+behind an optional extra + dedicated CLI means:
+- base install stays lean (no Java/driver footprint),
+- the production retrieval path (MS GraphRAG → DuckDB → LLM) is unchanged,
+- the loader is idempotent and re-runnable without touching `work/`.
+
+**Performance.** First load on the bundled corpus (8.6k entities, 21.7k
+relationships, 1.8k communities, 1k text units) completes in ~25s end-to-end
+on a laptop. Subsequent reloads are similar (`MERGE` is the bottleneck, not
+network).
+

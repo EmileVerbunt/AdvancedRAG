@@ -73,6 +73,30 @@ Discovery run on an unfamiliar corpus:
 uv run ke ingest <doc.pdf> --mode discovery
 ```
 
+## Visualize the graph (Neo4j)
+
+After an MS GraphRAG ingest, you can browse the knowledge graph visually in
+Neo4j Browser — great for demos and for spotting why GraphRAG beats lexical
+retrieval on multi-hop questions.
+
+```bash
+# 1. Install the extra (one-time)
+uv sync --extra neo4j
+
+# 2. Bring up Neo4j 5 + APOC + GDS in Docker (one-time)
+uv run ke neo4j up
+
+# 3. Load the latest MS GraphRAG parquets (auto-detects work/graphrag/<ver>/output/)
+uv run ke neo4j load
+
+# 4. Open Neo4j Browser (default: http://localhost:7474, neo4j / graphrag-demo)
+uv run ke neo4j open
+```
+
+Paste queries from `infrastructure/neo4j/demo_queries.cypher` (Character.AI
+subgraph, shortest path Setzer ↔ Crecente, top-degree entities, PageRank, etc.).
+`ke neo4j down` stops the container; `ke neo4j wipe` clears all graph data.
+
 ## Architecture
 
 See [`architecture.md`](./architecture.md). Layered domain → application → infrastructure with adapters behind ports for OCR, LLM, vision, embeddings, vector store, graph store, relational store, and checkpoints.
