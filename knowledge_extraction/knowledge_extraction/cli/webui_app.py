@@ -25,6 +25,7 @@ from knowledge_extraction.application.services.ms_graphrag_agent import (
     MsGraphRagAgent,
 )
 from knowledge_extraction.application.services.prompt_registry import PromptRegistry
+from knowledge_extraction.application.services.text_dedup import dedupe_by_text
 from knowledge_extraction.config.settings import AzureAuthMode, Settings, get_settings
 from knowledge_extraction.infrastructure.llm.azure_foundry_client import AzureFoundryLLM
 
@@ -451,7 +452,9 @@ def _build_lazy_evidence(
                 "page": ref.page,
             }
         )
-    return evidence
+    # Final defensive pass: collapse items with the same snippet text (catches
+    # cross-kind overlap, e.g. a chunk whose body also surfaced as a claim).
+    return dedupe_by_text(evidence, key=lambda e: str(e.get("snippet", "")))
 
 
 def _build_mini_evidence(
@@ -532,7 +535,9 @@ def _build_mini_evidence(
                 "page": ref.page,
             }
         )
-    return evidence
+    # Final defensive pass: collapse items with the same snippet text (catches
+    # cross-kind overlap, e.g. a chunk whose body also surfaced as a claim).
+    return dedupe_by_text(evidence, key=lambda e: str(e.get("snippet", "")))
 
 
 def _collect_mini_refs(hits: list[RetrievalHit]) -> tuple[set[str], set[str]]:

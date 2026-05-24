@@ -17,6 +17,8 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
+from knowledge_extraction.application.services.text_dedup import dedupe_by_text
+
 _TOKEN_RE = re.compile(r"[a-z0-9]{3,}")
 _STOPWORDS = frozenset(
     {
@@ -124,7 +126,11 @@ class ChunkRetriever:
                 continue
             scored.append(_row_to_hit(r, score=score))
         scored.sort(key=lambda h: h.score, reverse=True)
-        return scored[: max(1, top_k)]
+        # Collapse near-duplicate chunks (same text, different document_id —
+        # happens when a PDF is ingested twice, e.g. a slice + full run). Dedup
+        # AFTER sort so the highest-scoring twin survives, then trim to top_k.
+        deduped = dedupe_by_text(scored, key=lambda h: h.text)
+        return deduped[: max(1, top_k)]
 
 
 def _row_to_hit(row: sqlite3.Row, *, score: float) -> ChunkHit:

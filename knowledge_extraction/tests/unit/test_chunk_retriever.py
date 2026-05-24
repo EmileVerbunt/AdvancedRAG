@@ -121,3 +121,44 @@ def test_neighbors_returns_empty_for_unknown_chunk(populated_db: Path) -> None:
 def test_neighbors_returns_empty_for_zero_window(populated_db: Path) -> None:
     r = ChunkRetriever(populated_db)
     assert r.neighbors("c1", window=0) == []
+
+
+def test_search_dedupes_near_duplicate_chunks_across_documents(tmp_path: Path) -> None:
+    """When the same PDF is ingested twice (e.g. slice + full run), the two
+    document_ids hold chunks with identical text. The retriever must collapse
+    them so top-K shows distinct content."""
+    db = tmp_path / "knowledge.db"
+    con = sqlite3.connect(str(db))
+    try:
+        con.execute(
+            "CREATE TABLE documents (id TEXT PRIMARY KEY, title TEXT, source_path TEXT, page_count INTEGER, created_at TEXT)"
+        )
+        con.execute(
+            """CREATE TABLE chunks (
+                id TEXT PRIMARY KEY, document_id TEXT, section_id TEXT, text TEXT,
+                page_start INTEGER, page_end INTEGER,
+                figure_refs_json TEXT, table_refs_json TEXT, token_estimate INTEGER
+            )"""
+        )
+        con.execute("INSERT INTO documents VALUES ('doc-full', 'Report', '/x.pdf', 100, '2024')")
+        con.execute("INSERT INTO documents VALUES ('doc-slice', 'Report (first 10)', '/x.first10.pdf', 10, '2024')")
+        # Same text, different chunk ids + different document_ids.
+        same = "Anthropic released Claude Opus in March 2024 with notable benchmark wins."
+        con.executemany(
+            "INSERT INTO chunks VALUES (?, ?, NULL, ?, 1, 1, NULL, NULL, 10)",
+            [
+                ("c-full", "doc-full", same),
+                ("c-slice", "doc-slice", same),
+                ("c-other", "doc-full", "Industry investment in AI surged year over year."),
+            ],
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    r = ChunkRetriever(db)
+    hits = r.search("When was Claude Opus released?", top_k=5)
+    # Without dedup we'd get both c-full and c-slice; with dedup only the
+    # highest-scoring twin survives.
+    claude_hits = [h for h in hits if "Claude Opus" in h.text]
+    assert len(claude_hits) == 1, f"expected 1 Claude hit, got {len(claude_hits)}"

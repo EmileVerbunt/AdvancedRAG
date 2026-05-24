@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from knowledge_extraction.application.services.query_rewriter import reciprocal_rank_fusion
+from knowledge_extraction.application.services.text_dedup import dedupe_by_text
 
 _TOKEN_RE = re.compile(r"[a-z0-9]{3,}")
 _DATE_PATTERN = re.compile(r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2},?\s+20\d{2}\b", re.I)
@@ -188,7 +189,11 @@ class MiniGraphRagAgent:
             if _table_exists(con, "chunks"):
                 candidates.extend(self._chunk_candidates(con, query_terms))
             candidates.sort(key=lambda h: h.score, reverse=True)
-            return candidates[:max(1, top_k)]
+            # Collapse near-duplicate hits (same text from different docs OR same
+            # text surfaced as both chunk + claim/relationship). Highest-scoring
+            # twin survives because we dedup after sort.
+            deduped = dedupe_by_text(candidates, key=lambda h: h.text)
+            return deduped[:max(1, top_k)]
         finally:
             con.close()
 
