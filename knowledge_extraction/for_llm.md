@@ -8,7 +8,7 @@
 ## 1. What this system is
 
 A two-stage Retrieval-Augmented Generation pipeline that turns PDFs into three
-parallel, queryable knowledge stores and then exposes three retrieval backends
+parallel, queryable knowledge stores and then exposes four retrieval backends
 over them:
 
 ```
@@ -47,6 +47,7 @@ over them:
                                         ▼
                        3 retrieval backends share these stores:
                        mini (lexical) · lazy (JIT) · ms (Microsoft GraphRAG)
+                       + 1 reasoning backend: agentic (bounded multi-step loop)
 ```
 
 The on-disk artifacts after a full ingest of one PDF:
@@ -94,13 +95,13 @@ Ports (Python `Protocol`) live in `application/ports/__init__.py`:
 | Port                  | Implementation                                                         |
 | --------------------- | ---------------------------------------------------------------------- |
 | `IngestionPort`       | `infrastructure/ingestion/document_intelligence_adapter.py`            |
-| `PageRendererPort`    | `infrastructure/rendering/pypdfium_renderer.py`                        |
+| `PageRendererPort`    | `infrastructure/ingestion/pdf_renderer.py` (`PdfPageRenderer`)         |
 | `LLMPort`             | `infrastructure/llm/azure_foundry_client.py` (Azure OpenAI / Foundry)  |
 | `VisionPort`          | same client, vision-capable model                                      |
 | `EmbeddingPort`       | same client, embedding model                                           |
 | `RelationalStorePort` | `infrastructure/persistence/sqlite/repositories.py: RelationalRepository` |
 | `GraphStorePort`      | `infrastructure/persistence/graph/networkx_store.py`                   |
-| `CheckpointPort`      | `infrastructure/persistence/checkpoints.py`                            |
+| `CheckpointPort`      | `infrastructure/checkpointing/filesystem_checkpoint_store.py`          |
 
 `MsGraphRagAgent` (the production retrieval path) shells out to the official
 `graphrag` CLI; it does **not** implement a port — it's a stand-alone service
@@ -145,6 +146,10 @@ orchestrator is a tiny DAG runner that:
 `infrastructure/ingestion/document_intelligence_adapter.py: DocumentIntelligenceAdapter`
 
 - Calls Azure AI Document Intelligence (`prebuilt-layout` model).
+- **Fallback**: if `AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT` is not set, falls through
+  to `DoclingIngestionAdapter` (local CPU, no Azure dependency). The composition
+  root in `cli/main.py: _build_services` builds an `ingestion_chain` and
+  `pick_first_working_ingestion` tries each adapter in order.
 - Persists four artifacts under `work/artifacts/<doc-stem>/`:
   - `layout.json` (raw API response)
   - `doc.md` (markdown with `<!-- PageBreak -->` markers)
@@ -174,7 +179,7 @@ orchestrator is a tiny DAG runner that:
 
 ### 3.4 Stage 2 — render
 
-`infrastructure/rendering/pypdfium_renderer.py`
+`infrastructure/ingestion/pdf_renderer.py: PdfPageRenderer`
 
 - Renders every page to `work/artifacts/<doc-stem>/pages/page_NNNN.png` at 150 dpi.
 - Pure local CPU; no external services. Resumable: skips pages whose PNG exists.
@@ -308,7 +313,7 @@ contract is stable.
 
 If `community_reports.parquet` is missing, `graphrag query` will throw
 `ValueError: Could not find community_reports.parquet in storage!` —
-re-run `ke graphrag-index` to regenerate.
+re-run `ke graphrag index` to regenerate.
 
 ---
 
@@ -360,20 +365,26 @@ NetworkX in-memory store (`infrastructure/persistence/graph/networkx_store.py`).
 Not durable — every run rebuilds it from SQLite. The three serialized exports
 are the durable form.
 
-### 4.4 MS GraphRAG index
+### 4.4 Qdrant vector store (infrastructure exists, not currently wired)
 
-Parquet files under `work/graphrag/<ontology>/output/`. Read by the official
+`infrastructure/persistence/qdrant/qdrant_vector_store.py` implements
+`VectorStorePort` and `settings.py` exposes `vector_db_path` / `qdrant_url` /
+`qdrant_api_key`. However, `VectorStorePort` is **not** imported or used
+anywhere except its own definition — it is dead infrastructure. Canonicalization
+uses direct embedding calls via `EmbeddingPort`, not a vector store.
+
+### 4.5 MS GraphRAG index
 `graphrag query` CLI. We do **NOT** read these parquets directly anywhere in
 this codebase; the only consumer is the subprocess we shell out to.
 
 ---
 
-## 5. Retrieval — three backends, one knowledge base
+## 5. Retrieval — four backends, one knowledge base
 
-All three retrieval backends share the SQLite store + filesystem artifacts.
+All four retrieval backends share the SQLite store + filesystem artifacts.
 They differ in what they do at query time and what shape of evidence they
 return. Selectable in `ke webui` and `ke graphrag ask`/`eval` via
-`--backend mini|lazy|ms`.
+`--backend mini|lazy|ms|agentic`.
 
 ### 5.1 `mini` — lexical baseline (BM25-style)
 
@@ -451,13 +462,85 @@ the eval harness).
 Pre-flight check: `_latest_workdir()` requires all five required parquets
 (`_REQUIRED_QUERY_PARQUETS`) — `communities`, `community_reports`, `entities`,
 `relationships`, `text_units`. If any is missing it raises
-`IndexIncompleteError` with a remediation message ("run `ke graphrag-index`").
+`IndexIncompleteError` with a remediation message ("run `ke graphrag index`").
 
 **Use this when**: you want the full Microsoft GraphRAG stack —
 community-aware synthesis, multi-hop entity traversal, the SOTA quality but
 with the upfront indexing cost (~60 minutes for ~800 chunks).
 
-### 5.4 Evidence assembly (`mini` and `lazy` only)
+### 5.4 `agentic` — bounded multi-step reasoning loop
+
+`application/services/agentic_search_agent.py: AgenticSearchAgent`
+
+A self-contained bounded loop — no external agent framework required. Pure
+Python + existing service layer.
+
+```
+question
+  → Planner (LLM)  — 3–5 subquestions + retrieval hints (strict JSON)
+  → Searcher       — MiniGraphRagAgent.ask_multi(queries, top_k, include_graph=False)
+                     returns RetrievalResult; fuses via RRF internally
+  → EvidenceInspector — compress + label hits into EvidenceItem list
+  → Critic (LLM)   — assesses sufficiency; emits follow_up_queries if needed
+  → [loop back to Searcher if not sufficient AND round < max_rounds]
+  → Synthesizer (LLM) — grounded answer with inline [Cx] citations
+```
+
+Domain models (all pydantic):
+
+| Model | Purpose |
+|---|---|
+| `AgenticSearchOptions` | Loop bounds (max_rounds=2, max_subquestions=5, top_k_per_query=8, max_total_evidence_items=30) |
+| `SearchPlan` | Planner output: subquestions list |
+| `EvidenceItem` | Normalized hit: kind, text, score, document_id, citation_label |
+| `EvidenceCritique` | Critic output: sufficient, confidence, missing_information, follow_up_queries |
+| `AgenticTokenUsage` | Per-role token counts (planner, critic, synthesis) + totals |
+| `AgenticSearchAnswer` | Final: answer, plan, evidence, critique, rounds, token_usage, latency_ms |
+
+Key implementation details:
+
+- `ask()` wraps `ask_async()` via `asyncio.run()` — same pattern as `LazyGraphRagAgent`.
+- `_retrieve_evidence()` calls `self._mini.ask_multi(queries, top_k=..., include_graph=False)`
+  and uses **`.hits`** on the returned `RetrievalResult` — not the result directly.
+- `_merge_evidence()` deduplicates by `f"{item.kind}:{item.id}"` composite key and
+  caps at `max_total_evidence_items`.
+- `_safe_json(text)` strips markdown fences and parses the first valid JSON object —
+  same defensive pattern as `LazyGraphRagAgent._synthesize`.
+- Synthesis extracts prose from JSON wrapper via key probe (`"answer"/"response"/"result"/"text"`),
+  then falls back to raw text.
+- `critique` initialised to `EvidenceCritique(sufficient=True, ...)` before the loop so
+  `max_rounds=0` (synthesis-only mode) doesn't crash.
+- `critic_in_total` / `critic_out_total` **accumulate** across rounds (not overwrite).
+
+Model fallback chain:
+- `planner_model` / `critic_model` → `azure_openai_reasoning_model` ("o4-mini") → `azure_openai_extraction_model`
+- `synthesis_model` → `azure_openai_extraction_model`
+
+Observability events emitted: `agentic.plan`, `agentic.search`, `agentic.inspect`,
+`agentic.critic`, `agentic.synthesis`, `agentic.round`, `agentic.ask` — each with
+round, subquery_count, evidence_count, token totals, latency, model name.
+
+Prompt templates (`.j2` format, `SYSTEM:` / `USER:` sections):
+- `config/prompts/agentic_plan.v1.j2` — planner; produces `{"subquestions": [...]}`
+- `config/prompts/agentic_critic.v1.j2` — critic; produces `{"sufficient", "confidence", "missing_information", "follow_up_queries"}`
+- `config/prompts/agentic_synthesis.v1.j2` — synthesis; produces `{"answer": "..."}`
+
+Settings added in `config/settings.py`:
+```
+agentic_planner_model     — default "" (falls back to reasoning_model)
+agentic_critic_model      — default "" (falls back to reasoning_model)
+agentic_synthesis_model   — default "" (falls back to extraction_model)
+agentic_max_rounds        — default 2
+agentic_max_subquestions  — default 5
+agentic_top_k_per_query   — default 8
+```
+
+**Use this when**: the question is broad ("What are the major trends?"), ambiguous,
+or likely requires evidence from multiple document sections that a single retrieval
+pass would miss. Costs 4–10 LLM calls per ask (~20–60 s, ~8–20k tokens). Not
+suitable for simple factoid lookups — use `mini` or `lazy` instead.
+
+### 5.5 Evidence assembly (`mini` and `lazy` only)
 
 The webui builds an "evidence" panel from the retrieval output:
 
@@ -497,7 +580,7 @@ The system supports two extraction modes — pick via `ke ingest --mode <m>`:
 Tables: `ontology_versions`, `ontology_proposals`, `ontology_rejections`,
 `entity_aliases`, `entity_merges`, `drift_events`.
 
-CLI helpers: `ke ontology list|approve|reject|set-active|export`.
+CLI helpers: `ke ontology list|show|diff|approve|reject|propose|migrate`.
 
 ---
 
@@ -533,7 +616,7 @@ plus everything inside them.
 
 - **Stage-level checkpoints**: `.done` markers under
   `work/checkpoints/<doc_id>/<stage>/`. Implemented by
-  `infrastructure/persistence/checkpoints.py`. Skipped stages do NOT execute
+  `infrastructure/checkpointing/filesystem_checkpoint_store.py`. Skipped stages do NOT execute
   their stage closure.
 - **Chunk-level checkpoint**: the `chunk_extractions` table records expected
   entity/relationship/claim counts per chunk. On resume, the extract stage
@@ -572,6 +655,12 @@ Important fields:
 | `default_mode`                         | `governed` or `discovery`                            |
 | `active_ontology_version`              | Pin to a specific version, else newest approved      |
 | `observability_*`                      | Heartbeat + stall thresholds                         |
+| `agentic_planner_model`                | Override model for agentic planner (default: reasoning_model) |
+| `agentic_critic_model`                 | Override model for agentic critic (default: reasoning_model) |
+| `agentic_synthesis_model`              | Override model for agentic synthesis (default: extraction_model) |
+| `agentic_max_rounds`                   | Hard cap on agentic retrieval rounds (default 2)     |
+| `agentic_max_subquestions`             | Max subquestions per plan (default 5)                |
+| `agentic_top_k_per_query`              | top-k chunks per subquery (default 8)                |
 
 **Foundry key auth quirk**: if the Azure OpenAI resource has key auth disabled
 by policy, you must (1) set tag `SecurityControl=Ignore` on the resource and
@@ -596,11 +685,13 @@ Invoke with `uv run ke <command>`.
 | `ke ingest --redo-stage <stage>`   | Clear from that stage down and re-run                    |
 | `ke ingest --fresh`                | Wipe `work/` first                                       |
 | `ke ingest --build-knowledge-tree` | Also build MS GraphRAG index after extraction (default ON) |
-| `ke graphrag-index`                | Just (re)build the MS GraphRAG index from existing chunks|
-| `ke graphrag ask <q> --backend ms\|lazy\|mini` | One-shot question                            |
-| `ke graphrag eval <suite> --backend ms,lazy,mini` | Run an eval suite, optionally side-by-side|
-| `ke webui [--backend ms\|lazy\|mini]` | Launch the Streamlit chat UI on :8502                 |
-| `ke ontology list\|approve\|reject\|set-active\|export` | Manage ontology versions             |
+| `ke graphrag index`                | Just (re)build the MS GraphRAG index from existing chunks|
+| `ke graphrag ask <q> --backend ms\|lazy\|mini\|agentic\|auto` | One-shot question (--method local\|global\|drift\|basic\|auto) |
+| `ke graphrag eval --backend ms,lazy,mini,agentic` | Run an eval suite, optionally side-by-side       |
+| `ke webui [--backend ms\|lazy\|mini\|agentic] [--port 8502]` | Launch the Streamlit chat UI (Telemetry + Chat pages) |
+| `ke resume <pdf>`                  | Re-run; checkpointed stages are skipped                  |
+| `ke clean [--yes]`                 | Wipe all derived state (keeps assets/ and config)        |
+| `ke ontology list\|show\|diff\|approve\|reject\|propose\|migrate` | Manage ontology versions |
 
 The eval framework is at `application/services/graphrag_eval.py`:
 per-case metrics (MRR, precision@k, recall@k, citation_recall, top_score) plus
@@ -615,7 +706,7 @@ min_score_for_grounded`. Suite definition at
 ```powershell
 cd C:\_CODE\AdvancedRAG\knowledge_extraction
 uv run ruff check .         # lint
-uv run pytest -q            # all tests (~136 tests, ~30 s)
+uv run pytest -q            # all tests (~171 tests, ~30 s)
 uv run pytest -q tests/unit # unit only (fast)
 uv run ke webui             # local Streamlit UI
 ```
@@ -690,7 +781,7 @@ Tests of note:
 | Tune chunk sizes                        | `SemanticChunker(target_chars, max_chars)` in `cli/main.py`           |
 | Tune extraction concurrency             | `Settings.pipeline_concurrency`                                       |
 | Add a new figure cropping strategy      | `FigureInterpretationPipeline._figure_specs_from_document`            |
-| Add a new prompt                        | `config/prompts/<name>/<version>.{system,user}.txt` + register in `PromptRegistry` |
+| Add a new prompt                        | `config/prompts/<name>.v<n>.j2` + use `PromptRegistry.render(name, version, **ctx)` |
 | Modify the eval scoring                 | `application/services/graphrag_eval.py`                               |
 | Debug a stuck run                       | Read the latest `work/logs/run-*.jsonl` (one event per line)          |
 
@@ -718,6 +809,7 @@ knowledge_extraction/
 │   │   │   ├── ms_graphrag_agent.py        # production retrieval (MS GraphRAG CLI)
 │   │   │   ├── lazy_graphrag_agent.py      # JIT subgraph retrieval
 │   │   │   ├── graphrag_agent.py           # MiniGraphRagAgent (lexical baseline)
+│   │   │   ├── agentic_search_agent.py     # bounded multi-step agentic loop
 │   │   │   ├── chunk_retriever.py          # BM25 over chunks
 │   │   │   ├── canonicalization_service.py
 │   │   │   ├── ontology_governance.py
@@ -729,7 +821,8 @@ knowledge_extraction/
 │   │   └── use_cases/run_extraction.py  # THE pipeline entry point
 │   ├── infrastructure/
 │   │   ├── ingestion/document_intelligence_adapter.py
-│   │   ├── rendering/pypdfium_renderer.py
+│   │   ├── ingestion/docling_adapter.py         # local fallback (no Azure DI needed)
+│   │   ├── ingestion/pdf_renderer.py            # PdfPageRenderer (pypdfium2)
 │   │   ├── llm/azure_foundry_client.py
 │   │   ├── persistence/
 │   │   │   ├── sqlite/{models.py,repositories.py}
@@ -745,17 +838,23 @@ knowledge_extraction/
 ├── assets/*.pdf                      # documents to ingest
 ├── config/
 │   ├── ontologies/*.yaml
-│   ├── prompts/<name>/<version>.{system,user}.txt
+│   ├── prompts/<name>.v1.j2              # versioned jinja2 templates (SYSTEM: / USER: sections)
+│   │   ├── agentic_plan.v1.j2            # planner prompt
+│   │   ├── agentic_critic.v1.j2          # critic prompt
+│   │   └── agentic_synthesis.v1.j2       # synthesis prompt
 │   ├── graphrag_prompts/*.txt        # overlay templates for `graphrag init`
 │   └── evals/graphrag_eval.json
-├── infrastructure/neo4j/             # Docker stack + Cypher demo queries
-│   ├── docker-compose.yml
-│   ├── .env.example
-│   └── demo_queries.cypher
 ├── tests/{unit,integration}/
 ├── work/                             # all runtime artifacts (gitignored)
 ├── architecture.md                   # high-level human-oriented overview
 └── for_llm.md                        # this document
+
+# one level up, at the repo root (C:/_CODE/AdvancedRAG/):
+infrastructure/
+└── neo4j/
+    ├── docker-compose.yml            # Neo4j 5 + APOC + GDS; `ke neo4j up` uses this
+    ├── .env.example
+    └── demo_queries.cypher           # 9 ready-to-paste Cypher queries
 ```
 
 ## 15. Neo4j visualization layer (demo-only, opt-in)

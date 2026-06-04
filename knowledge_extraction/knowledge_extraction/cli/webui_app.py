@@ -10,6 +10,10 @@ from typing import Any
 
 import streamlit as st
 
+from knowledge_extraction.application.services.agentic_search_agent import (
+    AgenticSearchAgent,
+    AgenticSearchOptions,
+)
 from knowledge_extraction.application.services.chunk_retriever import ChunkRetriever
 from knowledge_extraction.application.services.graphrag_agent import (
     MiniGraphRagAgent,
@@ -40,6 +44,7 @@ BACKEND_LABELS = {
     "mini": "Evidence Retriever (Mini, no synthesis)",
     "lazy": "LazyGraphRAG (synthesized answer + citations)",
     "ms": "Microsoft GraphRAG (indexed synthesis)",
+    "agentic": "Agentic RAG (plan → retrieve → critique → synthesize)",
 }
 
 
@@ -143,6 +148,21 @@ def _build_lazy_agent(settings: Settings) -> LazyGraphRagAgent:
         llm=AzureFoundryLLM(settings),
         prompts=PromptRegistry(settings.prompts_dir),
         model=settings.azure_openai_extraction_model,
+    )
+
+
+def _build_agentic_agent(settings: Settings) -> AgenticSearchAgent:
+    from knowledge_extraction.application.services.graphrag_agent import MiniGraphRagAgent
+
+    mini = MiniGraphRagAgent(settings.sqlite_path, settings.graph_storage_path)
+    return AgenticSearchAgent(
+        settings=settings,
+        mini_agent=mini,
+        llm=AzureFoundryLLM(settings),
+        prompts=PromptRegistry(settings.prompts_dir),
+        planner_model=settings.agentic_planner_model or None,
+        critic_model=settings.agentic_critic_model or None,
+        synthesis_model=settings.agentic_synthesis_model or None,
     )
 
 
@@ -722,7 +742,7 @@ def _render_chat_page(settings: Settings, default_backend: str) -> None:
     st.caption("Ask questions and inspect evidence references (including diagram links).")
 
     c1, c2 = st.columns([1, 1])
-    backend_options = ["lazy", "mini", "ms"]
+    backend_options = ["lazy", "mini", "ms", "agentic"]
     backend = c1.selectbox(
         "Retrieval mode",
         backend_options,
@@ -832,6 +852,53 @@ def _render_chat_page(settings: Settings, default_backend: str) -> None:
                 )
                 return
 
+            if backend == "agentic":
+                agent = _build_agentic_agent(settings)
+                opts = AgenticSearchOptions(
+                    max_rounds=settings.agentic_max_rounds,
+                    max_subquestions=settings.agentic_max_subquestions,
+                    top_k_per_query=top_k,
+                )
+                with st.spinner(
+                    "Agentic RAG: planning subquestions → retrieving evidence → "
+                    "critiquing → synthesizing..."
+                ):
+                    answer = agent.ask(prompt, options=opts)
+                with st.expander("🗺 Plan", expanded=True):
+                    for i, sq in enumerate(answer.plan.subquestions, start=1):
+                        st.write(f"{i}. {sq}")
+                with st.expander(
+                    f"🔍 Evidence critique (round {answer.rounds}, "
+                    f"confidence={answer.critique.confidence:.0%})"
+                ):
+                    st.write(f"**Sufficient:** {answer.critique.sufficient}")
+                    if answer.critique.missing_information:
+                        st.write("**Missing information:**")
+                        for m in answer.critique.missing_information:
+                            st.write(f"- {m}")
+                    if answer.critique.follow_up_queries:
+                        st.write("**Follow-up queries used:**")
+                        for q in answer.critique.follow_up_queries:
+                            st.write(f"- {q}")
+                st.markdown(answer.answer)
+                with st.expander(f"📄 Evidence ({len(answer.evidence)} items)"):
+                    for e in answer.evidence:
+                        st.write(
+                            f"**{e.citation_label}** [{e.kind}] "
+                            f"score={e.score:.3f}"
+                            + (f" · p{e.page_start}" if e.page_start else "")
+                        )
+                        st.write(e.text[:300])
+                        st.divider()
+                st.caption(
+                    f"Agentic RAG · {answer.duration_ms} ms · "
+                    f"tokens={answer.tokens.total} · rounds={answer.rounds}"
+                )
+                st.session_state.messages.append(
+                    {"role": "assistant", "text": answer.answer}
+                )
+                return
+
             ms_agent = MsGraphRagAgent(settings)
             selected_method = None if ms_method == "auto" else ms_method
             with st.spinner(
@@ -884,7 +951,7 @@ def _render_chat_page(settings: Settings, default_backend: str) -> None:
 def main() -> None:
     args = _parse_cli()
     default_backend = str(args.backend or "lazy").lower()
-    if default_backend not in {"lazy", "mini", "ms"}:
+    if default_backend not in {"lazy", "mini", "ms", "agentic"}:
         default_backend = "lazy"
 
     st.set_page_config(page_title="KE WebUI", page_icon="🧩", layout="wide")

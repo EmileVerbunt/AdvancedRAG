@@ -74,6 +74,15 @@ class Settings(BaseSettings):
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     pipeline_concurrency: int = 8
 
+    # Agentic search settings
+    agentic_max_rounds: int = 2
+    agentic_max_subquestions: int = 5
+    agentic_top_k_per_query: int = 8
+    # Leave empty to fall back to azure_openai_reasoning_model / extraction_model
+    agentic_planner_model: str = ""
+    agentic_critic_model: str = ""
+    agentic_synthesis_model: str = ""
+
     # Microsoft GraphRAG. Resolved at use-time:
     #   1. explicit `graphrag_executable` env var if set
     #   2. else `graphrag` on PATH

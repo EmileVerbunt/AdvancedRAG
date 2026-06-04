@@ -21,6 +21,11 @@ from rich.table import Table
 
 from knowledge_extraction.application.pipelines.stage_1_chunking import SemanticChunker
 from knowledge_extraction.application.pipelines.stages import Stage
+from knowledge_extraction.application.services.agentic_search_agent import (
+    AgenticSearchAgent,
+    AgenticSearchOptions,
+    agentic_index_available,
+)
 from knowledge_extraction.application.services.chunk_retriever import ChunkRetriever
 from knowledge_extraction.application.services.graphrag_agent import MiniGraphRagAgent
 from knowledge_extraction.application.services.graphrag_eval import (
@@ -927,8 +932,8 @@ def webui(
         raise typer.Exit(code=1) from None
 
     chosen = backend.lower().strip()
-    if chosen not in {"lazy", "mini", "ms"}:
-        raise typer.BadParameter("backend must be one of: lazy, mini, ms")
+    if chosen not in {"lazy", "mini", "ms", "agentic"}:
+        raise typer.BadParameter("backend must be one of: lazy, mini, ms, agentic")
 
     app_path = _resolve_streamlit_app_path("knowledge_extraction.cli.webui_app", "webui_app.py")
     if not app_path.exists():
@@ -1048,7 +1053,9 @@ def graphrag_ask(
         "auto", "--backend", "-b",
         help="Retrieval backend: 'ms' (Microsoft GraphRAG, default when indexed), "
              "'lazy' (LazyGraphRAG — JIT subgraph at query time, no index), "
-             "'mini' (lexical BM25 baseline), or 'auto' (ms if indexed, else mini).",
+             "'mini' (lexical BM25 baseline), "
+             "'agentic' (multi-step planning + retrieval + critique), "
+             "or 'auto' (ms if indexed, else mini).",
     ),
     method: str = typer.Option(
         "auto", "--method", "-m",
@@ -1123,6 +1130,33 @@ def graphrag_ask(
             f"{lazy_answer.tokens.total} tokens[/bold cyan]"
         )
         console.print(lazy_answer.answer)
+        return
+
+    if chosen_backend == "agentic":
+        if not agentic_index_available(settings):
+            console.print(
+                f"[red]No chunks found in {settings.sqlite_path}. "
+                f"Run `ke ingest <pdf>` first to populate the chunk store.[/red]"
+            )
+            raise typer.Exit(code=2)
+        agentic_agent = _build_agentic_agent(settings)
+        agentic_opts = AgenticSearchOptions(
+            max_rounds=settings.agentic_max_rounds,
+            max_subquestions=settings.agentic_max_subquestions,
+            top_k_per_query=top_k,
+        )
+        agentic_answer = agentic_agent.ask(question, options=agentic_opts)
+        if as_json:
+            typer.echo(json.dumps(agentic_answer.to_dict(), ensure_ascii=True, indent=2))
+            return
+        console.print(
+            f"[bold cyan]Agentic RAG — {agentic_answer.duration_ms} ms, "
+            f"{len(agentic_answer.evidence)} evidence items, "
+            f"{agentic_answer.rounds} round(s), "
+            f"{agentic_answer.tokens.total} tokens[/bold cyan]"
+        )
+        console.print(f"[dim]Plan:[/dim] {', '.join(agentic_answer.plan.subquestions)}")
+        console.print(agentic_answer.answer)
         return
 
     if chosen_backend != "mini":
@@ -1201,8 +1235,10 @@ def graphrag_eval(
         case_sensitive=False,
         help="Retrieval backend(s): 'ms' (Microsoft GraphRAG, default and SOTA), "
              "'lazy' (LazyGraphRAG, JIT subgraph at query time), "
-             "'mini' (lexical BM25 baseline). Pass a comma-separated list "
-             "(e.g. 'ms,lazy,mini') for a side-by-side comparison run, or use "
+             "'mini' (lexical BM25 baseline), "
+             "'agentic' (multi-step planning + retrieval + critique). "
+             "Pass a comma-separated list "
+             "(e.g. 'ms,lazy,mini,agentic') for a side-by-side comparison run, or use "
              "'both' as a shorthand for 'mini,ms'.",
     ),
     method: str = typer.Option(
@@ -1218,6 +1254,7 @@ def graphrag_eval(
     response_type: str = typer.Option("Multiple Paragraphs", help="MS GraphRAG response type."),
     ms_timeout: int = typer.Option(180, help="Per-case timeout (seconds) for MS GraphRAG queries."),
     lazy_top_k: int = typer.Option(20, help="[lazy] chunks to retrieve per question."),
+    agentic_top_k: int = typer.Option(8, help="[agentic] evidence items per subquery."),
     top_k: int = typer.Option(15, help="Default top-k retrieval for cases that do not specify one"),
     rewrite: str = typer.Option(
         "none", "--rewrite",
@@ -1248,6 +1285,8 @@ def graphrag_eval(
         runs["mini"] = _run_mini_eval(cases, settings, top_k, rewriter=rewriter, rewrite_n=rewrite_n)
     if "lazy" in chosen_backends:
         runs["lazy"] = _run_lazy_eval(cases, settings, top_k_chunks=lazy_top_k)
+    if "agentic" in chosen_backends:
+        runs["agentic"] = _run_agentic_eval(cases, settings, top_k_per_query=agentic_top_k)
     if "ms" in chosen_backends:
         runs["ms"] = _run_ms_eval(
             cases, settings,
@@ -1298,13 +1337,13 @@ def _parse_backends(spec: str) -> list[str]:
     if raw == "both":
         return ["mini", "ms"]
     parts = [p.strip() for p in raw.split(",") if p.strip()]
-    valid = {"mini", "ms", "lazy"}
+    valid = {"mini", "ms", "lazy", "agentic"}
     seen: set[str] = set()
     ordered: list[str] = []
     for p in parts:
         if p not in valid:
             raise typer.BadParameter(
-                f"unknown backend: {p!r} (expected combination of mini | ms | lazy, or 'both')"
+                f"unknown backend: {p!r} (expected combination of mini | ms | lazy | agentic, or 'both')"
             )
         if p not in seen:
             seen.add(p)
@@ -1457,6 +1496,82 @@ def _run_lazy_eval(
             error_hit = RetrievalHit(
                 kind="lazy_error", id=f"lazy-error:{case.case_id}", score=0.0,
                 text=f"[lazy-graphrag error: {exc}]", meta={},
+            )
+            results.append(evaluate_case(case, [error_hit], mode="synthesis"))
+    return results
+
+
+def _build_agentic_agent(settings) -> AgenticSearchAgent:
+    """Wire an :class:`AgenticSearchAgent` from the standard settings."""
+    from knowledge_extraction.infrastructure.llm.azure_foundry_client import AzureFoundryLLM
+
+    llm = AzureFoundryLLM(settings)
+    prompts = PromptRegistry(settings.prompts_dir)
+    default_pdf = settings.project_root / "assets" / "hai_ai_index_report_2025.pdf"
+    default_md = settings.artifact_path / "hai_ai_index_report_2025" / "doc.md"
+    mini_agent = MiniGraphRagAgent(
+        settings.sqlite_path,
+        settings.graph_storage_path,
+        source_pdf=default_pdf if default_pdf.exists() else None,
+        source_markdown=default_md if default_md.exists() else None,
+    )
+    return AgenticSearchAgent(
+        settings,
+        mini_agent,
+        llm,
+        prompts,
+        planner_model=settings.agentic_planner_model or None,
+        critic_model=settings.agentic_critic_model or None,
+        synthesis_model=settings.agentic_synthesis_model or None,
+    )
+
+
+def _run_agentic_eval(
+    cases: list[GraphRagEvalCase],
+    settings,
+    *,
+    top_k_per_query: int,
+) -> list:
+    """Run each case through AgenticSearchAgent and evaluate the synthesized answer."""
+    from knowledge_extraction.application.services.graphrag_agent import RetrievalHit
+
+    if not agentic_index_available(settings):
+        raise typer.BadParameter(
+            f"No chunks found in {settings.sqlite_path}. Run `ke ingest <pdf>` first."
+        )
+    agent = _build_agentic_agent(settings)
+    results = []
+    for idx, case in enumerate(cases, start=1):
+        eval_question = case.query_rewrite or case.question
+        console.print(f"[dim]agentic[/dim] [{idx}/{len(cases)}] {case.case_id}: {eval_question[:80]}")
+        try:
+            opts = AgenticSearchOptions(
+                max_rounds=settings.agentic_max_rounds,
+                max_subquestions=settings.agentic_max_subquestions,
+                top_k_per_query=top_k_per_query,
+            )
+            answer = agent.ask(eval_question, options=opts)
+            synthetic_hit = RetrievalHit(
+                kind="agentic_answer",
+                id=f"agentic:{case.case_id}",
+                score=1.0,
+                text=answer.answer,
+                meta={
+                    "duration_ms": answer.duration_ms,
+                    "tokens": answer.tokens.total,
+                    "rounds": answer.rounds,
+                    "subquestions_count": len(answer.plan.subquestions),
+                    "evidence_count": len(answer.evidence),
+                    "critic_confidence": answer.critique.confidence,
+                    "evidence_sufficient": answer.critique.sufficient,
+                },
+            )
+            results.append(evaluate_case(case, [synthetic_hit], mode="synthesis"))
+        except RuntimeError as exc:
+            console.print(f"  [red]error:[/red] {exc}")
+            error_hit = RetrievalHit(
+                kind="agentic_error", id=f"agentic-error:{case.case_id}", score=0.0,
+                text=f"[agentic error: {exc}]", meta={},
             )
             results.append(evaluate_case(case, [error_hit], mode="synthesis"))
     return results

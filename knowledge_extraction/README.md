@@ -25,7 +25,7 @@ uv run ke webui --backend lazy
 uv run ke stats
 ```
 
-The Web UI supports retrieval backends (`lazy`, `mini`, `ms`) for side-by-side
+The Web UI supports four retrieval backends (`mini`, `lazy`, `ms`, `agentic`) for side-by-side
 demo and debugging flows.
 
 `ke ingest` now builds the Microsoft GraphRAG knowledge tree by default, so
@@ -35,16 +35,26 @@ demo and debugging flows.
 uv run ke ingest --no-build-knowledge-tree
 ```
 
-### Three retrieval modes
+### Four retrieval modes
 
-| Backend  | Ingestion cost | Per-query cost | When to use |
-|----------|----------------|----------------|-------------|
-| `mini`   | $0 (chunks only) | ~0 LLM, instant | Lexical baseline; offline; regression tests |
-| `ms`     | ~$87 / ~80 min for HAI corpus | 1 LLM call | SOTA: pre-built entity/community graph |
-| `lazy`   | **$0 — reuses chunks from any normal ingest** | 2 LLM calls (~10–20 s) | LazyGraphRAG: JIT subgraph at query time, no graph build |
+| Backend   | Ingestion cost | Per-query cost | When to use |
+|-----------|----------------|----------------|-------------|
+| `mini`    | $0 (chunks only) | ~0 LLM, instant | Lexical baseline; offline; regression tests |
+| `ms`      | ~$87 / ~80 min for HAI corpus | 1 LLM call | SOTA: pre-built entity/community graph |
+| `lazy`    | **$0 — reuses chunks from any normal ingest** | 2 LLM calls (~10–20 s) | LazyGraphRAG: JIT subgraph at query time, no graph build |
+| `agentic` | $0 | 4–10 LLM calls (~20–60 s) | Broad/ambiguous questions; multi-source reasoning; first retrieval likely incomplete |
+
+**Compute placement:**
+
+| Backend   | Compute spent when |
+|-----------|--------------------|
+| `ms`      | Upfront (index build) |
+| `lazy`    | At query time (graph construction) |
+| `agentic` | At query time (planning + reasoning + critique) |
 
 ```bash
 uv run ke webui --backend lazy
+uv run ke webui --backend agentic
 ```
 
 `ke webui` includes two pages in one app: **Telemetry** and **Chat**.
@@ -93,8 +103,8 @@ uv run ke neo4j load
 uv run ke neo4j open
 ```
 
-Paste queries from `infrastructure/neo4j/demo_queries.cypher` (Character.AI
-subgraph, shortest path Setzer ↔ Crecente, top-degree entities, PageRank, etc.).
+Paste queries from `../infrastructure/neo4j/demo_queries.cypher` (repo-root path;
+character subgraph, shortest-path traversal, top-degree entities, PageRank, etc.).
 `ke neo4j down` stops the container; `ke neo4j wipe` clears all graph data.
 
 ## Architecture
@@ -105,10 +115,24 @@ See [`architecture.md`](./architecture.md). Layered domain → application → i
 
 | Role        | Recommendation                                  |
 |-------------|-------------------------------------------------|
-| Reasoning   | `o4-mini` or `o3` (Discovery mode prefers this) |
-| Extraction  | `gpt-4.1-mini` / `gpt-4o-mini` (JSON mode)      |
+| Reasoning   | `o4-mini` or `o3` (Discovery mode + agentic planner/critic) |
+| Extraction  | `gpt-4.1-mini` / `gpt-4o-mini` (JSON mode, agentic synthesis) |
 | Vision      | `gpt-4.1` / `gpt-4o`                            |
 | Embeddings  | `text-embedding-3-large` (3072d)                |
+
+### Agentic search settings (`.env`)
+
+```env
+# Optional model overrides — fall back to reasoning/extraction models when unset
+AZURE_OPENAI_AGENTIC_PLANNER_MODEL=     # defaults to AZURE_OPENAI_REASONING_MODEL
+AZURE_OPENAI_AGENTIC_CRITIC_MODEL=      # defaults to AZURE_OPENAI_REASONING_MODEL
+AZURE_OPENAI_AGENTIC_SYNTHESIS_MODEL=   # defaults to AZURE_OPENAI_EXTRACTION_MODEL
+
+# Loop bounds
+AGENTIC_MAX_ROUNDS=2
+AGENTIC_MAX_SUBQUESTIONS=5
+AGENTIC_TOP_K_PER_QUERY=8
+```
 
 ## Layout
 
@@ -138,3 +162,37 @@ tests/
 3. `application/pipelines/orchestrator.py` — checkpoint-aware DAG runner
 4. `infrastructure/telemetry/observability.py` — wide events, heartbeats, token rollups
 5. `cli/main.py` — composition root that builds `ExtractionServices` and invokes the use case
+
+## CLI reference
+
+```
+ke preflight [--live/--no-live] [--graphrag]       # config / auth checks before a heavy run
+ke ingest [pdf|dir] [--mode discovery|governed]    # extract one PDF, a directory, or all assets/
+          [--pages N] [--fresh] [--redo-stage STAGE]
+          [--build-knowledge-tree/--no-build-knowledge-tree]
+ke resume <pdf> [--mode …] [--pages N]             # re-run; already-checkpointed stages are skipped
+ke stats                                           # persistence + governance + drift summary
+ke clean [--yes]                                   # wipe all derived state (keeps assets/ and config)
+ke webui [--backend lazy|mini|ms|agentic] [--port 8502]    # Streamlit UI (Telemetry + Chat pages)
+
+ke ontology list                                   # show all versions and proposals
+ke ontology show <version>                         # print ontology YAML
+ke ontology diff <a> <b>                           # diff two ontology versions
+ke ontology approve <proposal_id> [--by NAME]      # promote proposal → new ontology version
+ke ontology reject  <proposal_id> --reason TEXT
+ke ontology propose <yaml_file>  [--base VERSION]  # submit a YAML as a new proposal
+ke ontology migrate <from_version> <to_version>    # relabel existing graph nodes
+
+ke graphrag index                                  # (re-)run Microsoft GraphRAG indexing
+ke graphrag ask <question> [--backend ms|lazy|mini|agentic|auto]
+                            [--method local|global|drift|basic|auto]
+                            [--top-k N] [--rewrite none|lexical|llm] [--json]
+ke graphrag eval [--suite PATH] [--backend ms|lazy|mini|agentic|both|<comma-list>]
+                 [--method …] [--json]             # run scored eval suite against one or more backends
+
+ke neo4j up      # start Neo4j 5 + APOC + GDS in Docker
+ke neo4j load    # import latest GraphRAG parquets into Neo4j
+ke neo4j open    # open Neo4j Browser in the default browser
+ke neo4j down    # stop the Neo4j container
+ke neo4j wipe    # clear all graph data from Neo4j
+```
