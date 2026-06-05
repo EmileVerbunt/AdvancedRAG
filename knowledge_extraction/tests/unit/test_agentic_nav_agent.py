@@ -447,6 +447,18 @@ def test_safe_json() -> None:
     assert _safe_json("[1, 2]") == {}
 
 
+def test_safe_json_tolerates_duplicated_object() -> None:
+    # Some chat models (observed with gpt-5.x) emit the JSON object twice; we must
+    # parse the first complete object and ignore the trailing duplicate.
+    dup = (
+        '{"thought":"open it","tool":"open_document","args":{"document_id":"d1"}}\n'
+        '{"thought":"open it","tool":"open_document","args":{"document_id":"d1"}}'
+    )
+    parsed = _safe_json(dup)
+    assert parsed.get("tool") == "open_document"
+    assert parsed.get("args") == {"document_id": "d1"}
+
+
 def test_canonical_call_is_order_and_case_insensitive() -> None:
     a = _canonical_call("search_document", {"document_id": "doc1", "query": "Cost"})
     b = _canonical_call("search_document", {"query": "cost", "document_id": "doc1"})

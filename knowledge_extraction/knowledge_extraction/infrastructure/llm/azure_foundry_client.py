@@ -126,7 +126,13 @@ class AzureFoundryLLM:
 
 
 def _extract_json(text: str) -> str:
-    """Strip code fences / leading prose so json.loads succeeds even when response_format was rejected."""
+    """Return the first complete JSON object from a model response.
+
+    Handles code fences / leading prose, and — importantly — responses where the
+    model emits the object more than once (some chat models occasionally duplicate
+    their JSON output). Brace-matching returns only the first balanced ``{...}``
+    object so ``json.loads`` doesn't choke on trailing concatenated objects.
+    """
     s = text.strip()
     if s.startswith("```"):
         s = s.strip("`")
@@ -135,8 +141,31 @@ def _extract_json(text: str) -> str:
             s = s[4:]
         s = s.strip()
     start = s.find("{")
+    if start == -1:
+        return s or "{}"
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(s)):
+        c = s[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return s[start : i + 1]
+    # Unbalanced — fall back to the first-brace .. last-brace span.
     end = s.rfind("}")
-    if start != -1 and end != -1 and end > start:
+    if end > start:
         return s[start : end + 1]
     return s or "{}"
 

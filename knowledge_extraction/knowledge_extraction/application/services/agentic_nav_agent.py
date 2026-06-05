@@ -25,6 +25,7 @@ unknown tools. The only side-effect-free tools available are those on
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from dataclasses import asdict, dataclass
@@ -477,11 +478,22 @@ def _canonical_call(tool: str, args: dict[str, str]) -> str:
 
 
 def _safe_json(text: str) -> dict[str, Any]:
+    s = text.strip()
     try:
-        loaded = orjson.loads(text)
+        loaded = orjson.loads(s)
         return loaded if isinstance(loaded, dict) else {}
     except Exception:
-        return {}
+        pass
+    # Some models emit the object more than once or append trailing data; parse the
+    # first complete JSON object and ignore the rest.
+    start = s.find("{")
+    if start != -1:
+        try:
+            obj, _ = json.JSONDecoder().raw_decode(s[start:])
+            return obj if isinstance(obj, dict) else {}
+        except Exception:
+            return {}
+    return {}
 
 
 __all__ = [
