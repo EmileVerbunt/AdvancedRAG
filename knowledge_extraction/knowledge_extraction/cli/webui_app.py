@@ -813,11 +813,13 @@ def _render_chat_page(settings: Settings, default_backend: str) -> None:
     st.caption("Ask questions and inspect evidence references (including diagram links).")
 
     c1, c2 = st.columns([1, 1])
-    backend_options = ["lazy", "mini", "ms", "agentic", "nav"]
-    backend = c1.selectbox(
+    # Ordered by increasing complexity: evidence → graphrag → lazygraphrag → agentic → navigator.
+    backend_options = ["mini", "ms", "lazy", "agentic", "nav"]
+    default_index = backend_options.index(default_backend) if default_backend in backend_options else 0
+    backend = c1.radio(
         "Retrieval mode",
         backend_options,
-        index=backend_options.index(default_backend),
+        index=default_index,
         format_func=lambda b: BACKEND_LABELS.get(b, b),
     )
     top_k = c2.slider("Top K", min_value=3, max_value=30, value=10, step=1)
