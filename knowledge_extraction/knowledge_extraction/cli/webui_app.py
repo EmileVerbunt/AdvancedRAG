@@ -771,44 +771,60 @@ def _render_telemetry_page(settings: Settings) -> None:
         )
 
 
-def _render_demo_queries(settings: Settings, backend: str) -> None:
-    """Render the curated demo-query ladder as one-click preset buttons in an expander."""
+def _render_demo_panel(settings: Settings) -> None:
+    """Render the curated demo-query ladder as always-visible one-click presets (right column)."""
+    st.markdown("### 🎬 Demo queries")
     tiers = _load_demo_queries(settings)
     if not tiers:
+        st.caption("No demo_queries.json found in config/evals.")
         return
-    with st.expander("Demo queries (click to run)", expanded=False):
-        st.caption(
-            "A backend-comparison ladder over the ingested corpus. Tier 1 plain RAG suffices; "
-            "Tier 2 needs GraphRAG; Tier 3 favours Agentic/Nav; Tier 4 should be refused. "
-            f"Active mode: **{BACKEND_LABELS.get(backend, backend)}** — switch modes above to contrast results."
+    backend = str(st.session_state.get("chat_backend", "") or "")
+    st.caption(
+        "Click a query to run it in the current mode. A backend-comparison ladder: "
+        "Tier 1 plain RAG suffices; Tier 2 needs GraphRAG; Tier 3 favours Agentic/Nav; "
+        "Tier 4 should be refused."
+        + (
+            f" Active mode: **{BACKEND_LABELS.get(backend, backend)}**."
+            if backend
+            else ""
         )
-        for t_idx, tier in enumerate(tiers):
-            label = str(tier.get("label", tier.get("id", "Tier")))
-            rec = str(tier.get("recommended_backend", "")).strip()
-            header = f"**{label}**"
-            if rec:
-                header += f"  ·  best mode: `{rec}`"
-            st.markdown(header)
-            summary = str(tier.get("summary", "")).strip()
-            if summary:
-                st.caption(summary)
-            queries = tier.get("queries", [])
-            if not isinstance(queries, list):
+    )
+    for t_idx, tier in enumerate(tiers):
+        label = str(tier.get("label", tier.get("id", "Tier")))
+        rec = str(tier.get("recommended_backend", "")).strip()
+        header = f"**{label}**"
+        if rec:
+            header += f"  ·  best mode: `{rec}`"
+        st.markdown(header)
+        summary = str(tier.get("summary", "")).strip()
+        if summary:
+            st.caption(summary)
+        queries = tier.get("queries", [])
+        if not isinstance(queries, list):
+            continue
+        for q_idx, query in enumerate(queries):
+            text = str(query.get("text", "")).strip()
+            if not text:
                 continue
-            for q_idx, query in enumerate(queries):
-                text = str(query.get("text", "")).strip()
-                if not text:
-                    continue
-                if st.button(text, key=f"demo-{t_idx}-{q_idx}"):
-                    st.session_state["_demo_prompt"] = text
-                    st.rerun()
-                watch_for = str(query.get("watch_for", "")).strip()
-                if watch_for:
-                    st.caption(f"👀 {watch_for}")
-            st.divider()
+            if st.button(text, key=f"demo-{t_idx}-{q_idx}", use_container_width=True):
+                st.session_state["_demo_prompt"] = text
+                st.rerun()
+            watch_for = str(query.get("watch_for", "")).strip()
+            if watch_for:
+                st.caption(f"👀 {watch_for}")
+        st.divider()
+
 
 
 def _render_chat_page(settings: Settings, default_backend: str) -> None:
+    chat_col, demo_col = st.columns([3, 1], gap="large")
+    with chat_col:
+        _render_chat_column(settings, default_backend)
+    with demo_col:
+        _render_demo_panel(settings)
+
+
+def _render_chat_column(settings: Settings, default_backend: str) -> None:
     st.subheader("Chat")
     st.caption("Ask questions and inspect evidence references (including diagram links).")
 
@@ -821,6 +837,7 @@ def _render_chat_page(settings: Settings, default_backend: str) -> None:
         backend_options,
         index=default_index,
         format_func=lambda b: BACKEND_LABELS.get(b, b),
+        key="chat_backend",
     )
     top_k = c2.slider("Top K", min_value=3, max_value=30, value=10, step=1)
     st.caption(f"Active mode: **{BACKEND_LABELS.get(backend, backend)}**")
@@ -839,8 +856,6 @@ def _render_chat_page(settings: Settings, default_backend: str) -> None:
     if st.button("Clear chat"):
         st.session_state.pop("messages", None)
         st.rerun()
-
-    _render_demo_queries(settings, backend)
 
     st.caption(f"SQLite: {settings.sqlite_path}")
     if settings.azure_auth_mode is AzureAuthMode.KEY:
