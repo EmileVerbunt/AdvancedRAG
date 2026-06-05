@@ -66,6 +66,36 @@ def _load_demo_queries(settings: Settings) -> list[dict[str, Any]]:
     return tiers if isinstance(tiers, list) else []
 
 
+def _load_demo_cypher(settings: Settings) -> dict[str, Any]:
+    """Load the curated Neo4j demo Cypher queries, returning {} if absent or malformed."""
+    path = settings.project_root / "config" / "evals" / "demo_cypher.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def _neo4j_reachable(host: str = "localhost", port: int = 7474) -> bool:
+    """Best-effort check that the Neo4j Browser HTTP port is open (cached briefly)."""
+    import socket
+
+    try:
+        with socket.create_connection((host, port), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+def _neo4j_deeplink(browser_url: str, cypher: str) -> str:
+    """Build a Neo4j Browser deep link that pre-fills the editor with a Cypher query."""
+    import urllib.parse
+
+    base = browser_url.rstrip("/")
+    return f"{base}/?cmd=edit&arg={urllib.parse.quote(cypher)}"
+
+
 @dataclass(slots=True)
 class FigureRef:
     id: str
@@ -828,6 +858,42 @@ def _render_demo_panel(settings: Settings) -> None:
         st.divider()
 
 
+def _render_neo4j_panel(settings: Settings) -> None:
+    """Render demo Cypher queries + a deep link into the Neo4j Browser (right column)."""
+    data = _load_demo_cypher(settings)
+    queries = data.get("queries")
+    if not isinstance(queries, list) or not queries:
+        return
+    browser_url = str(data.get("browser_url") or "http://localhost:7474/browser/")
+    st.markdown("### 🌐 Neo4j graph")
+    reachable = _neo4j_reachable()
+    if reachable:
+        st.caption("🟢 Neo4j reachable — run these in the Browser to show the graph live.")
+    else:
+        st.caption("🔴 Neo4j not reachable. Start it with `ke neo4j up` then `ke neo4j load`.")
+    auth_hint = str(data.get("auth_hint") or "").strip()
+    if auth_hint:
+        st.caption(auth_hint)
+    st.link_button("Open Neo4j Browser ↗", browser_url, use_container_width=True)
+
+    for c_idx, query in enumerate(queries):
+        label = str(query.get("label", f"Query {c_idx + 1}")).strip()
+        cypher = str(query.get("cypher", "")).strip()
+        if not cypher:
+            continue
+        st.markdown(f"**{label}**")
+        description = str(query.get("description", "")).strip()
+        if description:
+            st.caption(description)
+        st.code(cypher, language="cypher")
+        st.link_button(
+            "▸ Open pre-filled in Browser",
+            _neo4j_deeplink(browser_url, cypher),
+            use_container_width=True,
+        )
+    st.caption("Tip: if the pre-filled link doesn't populate, use the copy button on the query above.")
+
+
 
 def _render_chat_page(settings: Settings, default_backend: str) -> None:
     chat_col, demo_col = st.columns([3, 1], gap="large")
@@ -835,6 +901,7 @@ def _render_chat_page(settings: Settings, default_backend: str) -> None:
         _render_chat_column(settings, default_backend)
     with demo_col:
         _render_demo_panel(settings)
+        _render_neo4j_panel(settings)
 
 
 def _render_chat_column(settings: Settings, default_backend: str) -> None:

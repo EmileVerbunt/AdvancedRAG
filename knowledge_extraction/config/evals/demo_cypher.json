@@ -1,0 +1,42 @@
+{
+  "_doc": "Curated demo Cypher queries for the Neo4j Browser, run against the MS GraphRAG knowledge graph loaded by `ke neo4j load` (schema: (:Entity)-[:RELATED_TO]->(:Entity), (:Entity)-[:IN_COMMUNITY]->(:Community), (:Community)-[:PARENT_OF]->(:Community), (:Entity)-[:MENTIONED_IN]->(:TextUnit)). Entity titles are UPPER-CASED as emitted by GraphRAG. These mirror the chat demo ladder — especially the Character.AI relationship-bridging case that BM25 cannot answer — so the graph view can be shown side-by-side with the agent answer. The webui right column renders each as a copyable code block plus a deep link into http://localhost:7474/browser/.",
+  "browser_url": "http://localhost:7474/browser/",
+  "auth_hint": "default auth: neo4j / graphrag-demo (override with NEO4J_PASSWORD)",
+  "queries": [
+    {
+      "label": "Graph at a glance",
+      "description": "Node counts per label — entities, communities, text units.",
+      "cypher": "MATCH (n) RETURN labels(n)[0] AS label, count(*) AS count ORDER BY count DESC;"
+    },
+    {
+      "label": "Schema (labels + relationships)",
+      "description": "Visual meta-graph of node labels and relationship types.",
+      "cypher": "CALL db.schema.visualization();"
+    },
+    {
+      "label": "⭐ Character.AI incident graph",
+      "description": "1-hop neighbourhood of CHARACTER.AI. This is the relationship-bridging case BM25 fails on: the victims (Sewell Setzer, Jennifer Ann Crecente), the lawsuit, and the Google deal all surface as connected entities.",
+      "cypher": "MATCH (c:Entity {title:'CHARACTER.AI'})-[r:RELATED_TO]-(n:Entity)\nRETURN c, r, n;"
+    },
+    {
+      "label": "Character.AI — 2-hop context",
+      "description": "Expand two hops out from CHARACTER.AI to see the wider incident cluster.",
+      "cypher": "MATCH p = (c:Entity {title:'CHARACTER.AI'})-[:RELATED_TO*1..2]-(n:Entity)\nRETURN p LIMIT 75;"
+    },
+    {
+      "label": "Multi-hop: bridge two victims",
+      "description": "Shortest path linking the two separate Character.AI victims through the graph — the kind of multi-hop reasoning a chunk search cannot do.",
+      "cypher": "MATCH p = shortestPath(\n  (a:Entity {title:'SEWELL SETZER III'})-[:RELATED_TO*..6]-(b:Entity {title:'JENNIFER ANN CRECENTE'})\n)\nRETURN p;"
+    },
+    {
+      "label": "Most connected entities (hubs)",
+      "description": "Highest-degree entities — what the graph considers central to the corpus.",
+      "cypher": "MATCH (e:Entity)\nRETURN e.title, e.type, e.degree\nORDER BY e.degree DESC LIMIT 20;"
+    },
+    {
+      "label": "Top community reports",
+      "description": "GraphRAG community summaries ranked by importance — the basis for global/abstract questions.",
+      "cypher": "MATCH (c:Community)\nWHERE c.summary <> ''\nRETURN c.title, c.level, c.rank, left(c.summary, 240) AS summary\nORDER BY c.rank DESC LIMIT 10;"
+    }
+  ]
+}
