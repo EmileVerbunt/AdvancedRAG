@@ -10,11 +10,16 @@ from typing import Any
 
 import streamlit as st
 
+from knowledge_extraction.application.services.agentic_nav_agent import (
+    AgenticNavAgent,
+    AgenticNavOptions,
+)
 from knowledge_extraction.application.services.agentic_search_agent import (
     AgenticSearchAgent,
     AgenticSearchOptions,
 )
 from knowledge_extraction.application.services.chunk_retriever import ChunkRetriever
+from knowledge_extraction.application.services.document_navigator import DocumentNavigator
 from knowledge_extraction.application.services.graphrag_agent import (
     MiniGraphRagAgent,
     RetrievalHit,
@@ -45,7 +50,19 @@ BACKEND_LABELS = {
     "lazy": "LazyGraphRAG (synthesized answer + citations)",
     "ms": "Microsoft GraphRAG (indexed synthesis)",
     "agentic": "Agentic RAG (plan → retrieve → critique → synthesize)",
+    "nav": "Agentic Navigator (metadata routing → on-demand document reading)",
 }
+
+
+def _load_demo_queries(settings: Settings) -> list[dict[str, Any]]:
+    """Load the curated demo-query ladder, returning [] if the file is absent or malformed."""
+    path = settings.project_root / "config" / "evals" / "demo_queries.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    tiers = data.get("tiers")
+    return tiers if isinstance(tiers, list) else []
 
 
 @dataclass(slots=True)
@@ -148,6 +165,23 @@ def _build_lazy_agent(settings: Settings) -> LazyGraphRagAgent:
         llm=AzureFoundryLLM(settings),
         prompts=PromptRegistry(settings.prompts_dir),
         model=settings.azure_openai_extraction_model,
+    )
+
+
+def _build_agentic_nav_agent(settings: Settings) -> AgenticNavAgent:
+    navigator = DocumentNavigator(
+        settings.sqlite_path,
+        settings.artifact_path,
+        max_chars=settings.agentic_nav_max_chars,
+    )
+    return AgenticNavAgent(
+        settings=settings,
+        navigator=navigator,
+        llm=AzureFoundryLLM(settings),
+        prompts=PromptRegistry(settings.prompts_dir),
+        router_model=settings.agentic_nav_router_model or None,
+        navigator_model=settings.agentic_nav_navigator_model or None,
+        synthesis_model=settings.agentic_nav_synthesis_model or None,
     )
 
 
@@ -737,12 +771,49 @@ def _render_telemetry_page(settings: Settings) -> None:
         )
 
 
+def _render_demo_queries(settings: Settings, backend: str) -> None:
+    """Render the curated demo-query ladder as one-click preset buttons in an expander."""
+    tiers = _load_demo_queries(settings)
+    if not tiers:
+        return
+    with st.expander("Demo queries (click to run)", expanded=False):
+        st.caption(
+            "A backend-comparison ladder over the ingested corpus. Tier 1 plain RAG suffices; "
+            "Tier 2 needs GraphRAG; Tier 3 favours Agentic/Nav; Tier 4 should be refused. "
+            f"Active mode: **{BACKEND_LABELS.get(backend, backend)}** — switch modes above to contrast results."
+        )
+        for t_idx, tier in enumerate(tiers):
+            label = str(tier.get("label", tier.get("id", "Tier")))
+            rec = str(tier.get("recommended_backend", "")).strip()
+            header = f"**{label}**"
+            if rec:
+                header += f"  ·  best mode: `{rec}`"
+            st.markdown(header)
+            summary = str(tier.get("summary", "")).strip()
+            if summary:
+                st.caption(summary)
+            queries = tier.get("queries", [])
+            if not isinstance(queries, list):
+                continue
+            for q_idx, query in enumerate(queries):
+                text = str(query.get("text", "")).strip()
+                if not text:
+                    continue
+                if st.button(text, key=f"demo-{t_idx}-{q_idx}"):
+                    st.session_state["_demo_prompt"] = text
+                    st.rerun()
+                watch_for = str(query.get("watch_for", "")).strip()
+                if watch_for:
+                    st.caption(f"👀 {watch_for}")
+            st.divider()
+
+
 def _render_chat_page(settings: Settings, default_backend: str) -> None:
     st.subheader("Chat")
     st.caption("Ask questions and inspect evidence references (including diagram links).")
 
     c1, c2 = st.columns([1, 1])
-    backend_options = ["lazy", "mini", "ms", "agentic"]
+    backend_options = ["lazy", "mini", "ms", "agentic", "nav"]
     backend = c1.selectbox(
         "Retrieval mode",
         backend_options,
@@ -766,6 +837,8 @@ def _render_chat_page(settings: Settings, default_backend: str) -> None:
     if st.button("Clear chat"):
         st.session_state.pop("messages", None)
         st.rerun()
+
+    _render_demo_queries(settings, backend)
 
     st.caption(f"SQLite: {settings.sqlite_path}")
     if settings.azure_auth_mode is AzureAuthMode.KEY:
@@ -793,6 +866,8 @@ def _render_chat_page(settings: Settings, default_backend: str) -> None:
                 )
 
     prompt = st.chat_input("Ask a question about your ingested knowledge base")
+    if not prompt:
+        prompt = st.session_state.pop("_demo_prompt", None)
     if not prompt:
         return
 
@@ -899,6 +974,38 @@ def _render_chat_page(settings: Settings, default_backend: str) -> None:
                 )
                 return
 
+            if backend == "nav":
+                agent = _build_agentic_nav_agent(settings)
+                opts = AgenticNavOptions(
+                    max_docs=settings.agentic_nav_max_docs,
+                    max_steps=settings.agentic_nav_max_steps,
+                )
+                with st.spinner(
+                    "Agentic Navigator: routing to documents → navigating "
+                    "sections/tables/figures → synthesizing..."
+                ):
+                    answer = agent.ask(prompt, options=opts)
+                with st.expander("🗂 Documents selected", expanded=True):
+                    if answer.route_reasoning:
+                        st.caption(answer.route_reasoning)
+                    for d in answer.selected_documents:
+                        st.write(f"- {d}")
+                st.markdown(answer.answer)
+                with st.expander(f"🧭 Navigation trace ({answer.steps} step(s))"):
+                    for i, s in enumerate(answer.transcript, start=1):
+                        st.write(f"**{i}. {s.tool}** `{s.args}`")
+                        st.write(s.observation[:400])
+                        st.divider()
+                st.caption(
+                    f"Agentic Navigator · {answer.duration_ms} ms · "
+                    f"tokens={answer.tokens.total} · docs={len(answer.selected_documents)} · "
+                    f"steps={answer.steps}"
+                )
+                st.session_state.messages.append(
+                    {"role": "assistant", "text": answer.answer}
+                )
+                return
+
             ms_agent = MsGraphRagAgent(settings)
             selected_method = None if ms_method == "auto" else ms_method
             with st.spinner(
@@ -951,7 +1058,7 @@ def _render_chat_page(settings: Settings, default_backend: str) -> None:
 def main() -> None:
     args = _parse_cli()
     default_backend = str(args.backend or "lazy").lower()
-    if default_backend not in {"lazy", "mini", "ms", "agentic"}:
+    if default_backend not in {"lazy", "mini", "ms", "agentic", "nav"}:
         default_backend = "lazy"
 
     st.set_page_config(page_title="KE WebUI", page_icon="🧩", layout="wide")

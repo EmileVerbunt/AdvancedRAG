@@ -1,0 +1,92 @@
+{
+  "_doc": "Curated demo script for live backend comparison over the HAI AI Index Report 2025 corpus. Queries are grouped into a 'ladder' that shows where each retrieval strategy starts to earn its cost: Tier 1 plain RAG already suffices (graph/agentic = overkill); Tier 2 plain BM25/vector RAG fails but GraphRAG bridges entities/abstract vocabulary; Tier 3 agentic + nav shine via multi-step routing, figure parsing and cross-section verification; Tier 4 adversarial questions that every backend should refuse. All queries are drawn from config/evals/graphrag_eval.json so they are grounded in the ingested data. The webui Chat page renders these as one-click preset buttons (settings.project_root/config/evals/demo_queries.json).",
+  "tiers": [
+    {
+      "id": "tier1-plain-rag",
+      "label": "Tier 1 — Plain RAG nails it",
+      "summary": "Direct factoid lookups where the answer vocabulary matches the source. A single chunk has it; graph + agentic add latency/cost for no quality gain. Use these to set a baseline.",
+      "recommended_backend": "mini",
+      "queries": [
+        {
+          "text": "What was total corporate AI investment in 2024?",
+          "case_id": "private-ai-investment-record-high-2024",
+          "watch_for": "Mini/Lazy answer instantly from one chunk. Note how graph/agentic spend extra tokens for the same answer — overkill."
+        },
+        {
+          "text": "How much did inference cost drop for GPT-3.5-equivalent performance?",
+          "case_id": "inference-cost-drop-280x",
+          "watch_for": "Expect '280x' over '18 months'. Lexical terms are right in the text, so BM25 retrieval is enough."
+        },
+        {
+          "text": "When was Llama 3.1 405B released?",
+          "case_id": "llama31-405b-release-date",
+          "watch_for": "Date lives in a release-timeline table. Tabular fact, single hop — plain retrieval handles it."
+        }
+      ]
+    },
+    {
+      "id": "tier2-graphrag",
+      "label": "Tier 2 — Plain RAG fails, GraphRAG wins",
+      "summary": "Abstract query vocabulary or entity bridging across separate paragraphs. BM25/vector cannot connect the dots; entity/community-aware GraphRAG can. These are tagged DEMO-FAVORS-GRAPHRAG in the eval suite.",
+      "recommended_backend": "lazy",
+      "queries": [
+        {
+          "text": "What real-world incidents of harm to young people from chatbots are documented in the report?",
+          "case_id": "multihop-chatbot-harm-to-young-people",
+          "watch_for": "Source says '14-year-old boy', 'Sewell Setzer III', 'died by suicide' — none of the query words appear. Run Mini first (weak/missed), then Lazy/MS (bridges the abstract vocabulary)."
+        },
+        {
+          "text": "Which individuals are linked to incidents involving Character.AI, and how?",
+          "case_id": "relationship-character-ai-victim-bridge",
+          "watch_for": "Answer needs TWO cases (Setzer + Crecente) that live in different paragraphs but share the Character.AI entity. Graph edges surface both; BM25 grabs one or neither."
+        },
+        {
+          "text": "How has generative AI been used to impersonate a deceased individual without family consent?",
+          "case_id": "text-ai-impersonation-of-deceased-individual",
+          "watch_for": "'impersonate' / 'deceased' / 'without consent' are NOT in the source (it says 'murdered ... her image appeared in an AI chatbot ... discovered by her father'). Needs semantic/community bridging."
+        }
+      ]
+    },
+    {
+      "id": "tier3-agentic-nav",
+      "label": "Tier 3 — Where Agentic & Nav shine",
+      "summary": "Multi-step questions: metadata-route to the right document, open it, read a figure or distant section, then verify. Agentic plans+critiques; Nav navigates the actual document instead of pre-chunked text.",
+      "recommended_backend": "nav",
+      "queries": [
+        {
+          "text": "What is the performance of SuperGLUE?",
+          "case_id": "superglue-performance-disambiguation",
+          "watch_for": "Disambiguation trap: 'glue' can collide with adhesives. Nav opens the doc and reads Figure 2.1.33 (human baseline vs benchmark) instead of grabbing a lexically-similar wrong chunk."
+        },
+        {
+          "text": "Compare U.S. and China private AI investment in 2024 and identify which one led.",
+          "case_id": "multihop-us-china-private-investment-2024",
+          "watch_for": "Two figures to retrieve (US 109.1, China 9.3), then a comparison + verdict. Agentic/Nav do retrieve -> compare -> verify; watch the navigation trace expander."
+        },
+        {
+          "text": "Are the Czech Republic's AI talent indicators (hiring, migration, representation) consistent with its public AI spending?",
+          "case_id": "multihop-talent-vs-investment-czech-republic",
+          "watch_for": "Evidence is scattered across distant sections (talent vs. spending). Nav drills into multiple parts of the document and synthesizes a consistency judgement."
+        }
+      ]
+    },
+    {
+      "id": "tier4-adversarial",
+      "label": "Tier 4 — Adversarial (should refuse)",
+      "summary": "Out-of-scope questions with no grounding in the corpus. Every backend should decline rather than hallucinate. Demonstrates guardrails.",
+      "recommended_backend": "lazy",
+      "queries": [
+        {
+          "text": "What was Bitcoin's price in March 2024?",
+          "case_id": "adversarial-out-of-scope-bitcoin",
+          "watch_for": "No crypto pricing in an AI Index report. Good answer = explicit refusal / 'not in the documents', NOT a guessed number."
+        },
+        {
+          "text": "How tall is the Eiffel Tower?",
+          "case_id": "adversarial-out-of-scope-eiffel-tower",
+          "watch_for": "Completely off-corpus. Retrieval scores should stay below the grounded threshold; the agent should decline."
+        }
+      ]
+    }
+  ]
+}

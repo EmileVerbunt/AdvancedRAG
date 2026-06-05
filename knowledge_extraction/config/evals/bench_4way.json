@@ -1,0 +1,109 @@
+{
+  "_doc": "Curated 6-case suite for the 4-way backend benchmark (ke graphrag bench). Cases are drawn verbatim from graphrag_eval.json and chosen to differentiate mini / lazy / ms / agentic: a figure-disambiguation case, a tabular date lookup, a broad text/stat case, a multi-hop comparison, a relationship-bridging case (favours graph/agentic), and an adversarial out-of-scope case (tests refusal). Keep this small — running 4 backends with ms/agentic is slow.",
+  "cases": [
+    {
+      "case_id": "superglue-performance-disambiguation",
+      "question": "What is the performance of SuperGLUE?",
+      "query_rewrite": null,
+      "category": "diagram",
+      "focus_terms": ["superglue"],
+      "positive_terms": ["superglue", "human baseline", "technical performance benchmarks"],
+      "min_positive_term_matches": 2,
+      "domain_terms": ["figure 2.1.33"],
+      "negative_terms": ["adhesive", "cyanoacrylate", "bond strength"],
+      "expected_hit_kinds": ["chunk", "figure"],
+      "max_hit_rank": 5,
+      "min_domain_term_matches": 1,
+      "top_k": 15
+    },
+    {
+      "case_id": "falcon-mamba-release",
+      "question": "when did Falcom Mambo come out",
+      "query_rewrite": "when did Falcon Mamba come out",
+      "category": "tabular",
+      "focus_terms": ["falcon mamba", "falconmamba"],
+      "positive_terms": ["aug 12, 2024", "7b parameter", "mamba state space language model"],
+      "min_positive_term_matches": 2,
+      "domain_terms": ["llm", "technology innovation institute in abu dhabi"],
+      "negative_terms": ["jamba", "mistral mamba", "falcon llm"],
+      "expected_hit_kinds": ["chunk", "markdown", "table"],
+      "max_hit_rank": 6,
+      "min_domain_term_matches": 1,
+      "top_k": 15
+    },
+    {
+      "case_id": "inference-cost-drop-280x",
+      "question": "How much did inference cost drop for GPT-3.5-equivalent performance?",
+      "query_rewrite": null,
+      "category": "text",
+      "focus_terms": ["cost of querying an ai model", "inference"],
+      "positive_terms": ["280", "18 months"],
+      "min_positive_term_matches": 2,
+      "domain_terms": ["gpt-3.5"],
+      "negative_terms": ["training cost", "compute cost of training"],
+      "expected_hit_kinds": ["chunk"],
+      "max_hit_rank": 10,
+      "min_domain_term_matches": 1,
+      "top_k": 15
+    },
+    {
+      "case_id": "multihop-us-china-private-investment-2024",
+      "question": "Compare U.S. and China private AI investment in 2024 and identify which one led.",
+      "query_rewrite": "United States private AI investment 2024 versus China private AI investment 2024 ranking by country",
+      "category": "multihop",
+      "focus_terms": ["private ai investment"],
+      "positive_terms": ["united states", "china", "109.1", "9.3"],
+      "min_positive_term_matches": 3,
+      "domain_terms": ["private ai investment", "private investment"],
+      "negative_terms": ["public investment 2024", "europe led"],
+      "expected_hit_kinds": ["chunk", "claim", "figure"],
+      "max_hit_rank": 10,
+      "min_domain_term_matches": 1,
+      "top_k": 20
+    },
+    {
+      "_doc": "DEMO-FAVORS-GRAPHRAG: Tests entity-relationship retrieval. The question asks for *individuals* linked to Character.AI incidents; the answer requires bridging two distinct cases (Sewell Setzer + Crecente) that live in separate paragraphs but share the Character.AI entity. BM25 has no way to know which 'individuals' matter.",
+      "case_id": "relationship-character-ai-victim-bridge",
+      "question": "Which individuals are linked to incidents involving Character.AI, and how?",
+      "query_rewrite": "Named persons (victims, family members, defendants) connected to Character.AI lawsuits, impersonation incidents, or mental-health controversies — and the nature of each link.",
+      "category": "relationship",
+      "focus_terms": ["character.ai"],
+      "positive_terms": [
+        "sewell setzer iii",
+        "jennifer ann crecente",
+        "drew crecente",
+        "dany",
+        "lawsuit"
+      ],
+      "min_positive_term_matches": 2,
+      "domain_terms": ["character.ai"],
+      "negative_terms": [
+        "lmsys chatbot arena",
+        "chatbot arena leaderboard",
+        "mmlu",
+        "gpqa"
+      ],
+      "expected_hit_kinds": ["chunk", "claim", "entity", "relationship"],
+      "max_hit_rank": 10,
+      "min_domain_term_matches": 1,
+      "top_k": 25
+    },
+    {
+      "case_id": "adversarial-out-of-scope-bitcoin",
+      "question": "What was Bitcoin's price in March 2024?",
+      "query_rewrite": null,
+      "category": "adversarial",
+      "focus_terms": [],
+      "positive_terms": [],
+      "min_positive_term_matches": 0,
+      "domain_terms": [],
+      "negative_terms": [],
+      "expected_hit_kinds": [],
+      "max_hit_rank": 5,
+      "min_domain_term_matches": 0,
+      "top_k": 10,
+      "is_adversarial": true,
+      "min_score_for_grounded": 1.2
+    }
+  ]
+}

@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import sys
+import time
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -21,12 +22,26 @@ from rich.table import Table
 
 from knowledge_extraction.application.pipelines.stage_1_chunking import SemanticChunker
 from knowledge_extraction.application.pipelines.stages import Stage
+from knowledge_extraction.application.services.agentic_nav_agent import (
+    AgenticNavAgent,
+    AgenticNavOptions,
+)
 from knowledge_extraction.application.services.agentic_search_agent import (
     AgenticSearchAgent,
     AgenticSearchOptions,
     agentic_index_available,
 )
+from knowledge_extraction.application.services.benchmark import (
+    build_report,
+    read_ingestion_stats,
+    render_markdown,
+    summarize_cost,
+)
 from knowledge_extraction.application.services.chunk_retriever import ChunkRetriever
+from knowledge_extraction.application.services.document_navigator import (
+    DocumentNavigator,
+    nav_index_available,
+)
 from knowledge_extraction.application.services.graphrag_agent import MiniGraphRagAgent
 from knowledge_extraction.application.services.graphrag_eval import (
     GraphRagEvalCase,
@@ -932,8 +947,8 @@ def webui(
         raise typer.Exit(code=1) from None
 
     chosen = backend.lower().strip()
-    if chosen not in {"lazy", "mini", "ms", "agentic"}:
-        raise typer.BadParameter("backend must be one of: lazy, mini, ms, agentic")
+    if chosen not in {"lazy", "mini", "ms", "agentic", "nav"}:
+        raise typer.BadParameter("backend must be one of: lazy, mini, ms, agentic, nav")
 
     app_path = _resolve_streamlit_app_path("knowledge_extraction.cli.webui_app", "webui_app.py")
     if not app_path.exists():
@@ -1055,6 +1070,7 @@ def graphrag_ask(
              "'lazy' (LazyGraphRAG — JIT subgraph at query time, no index), "
              "'mini' (lexical BM25 baseline), "
              "'agentic' (multi-step planning + retrieval + critique), "
+             "'nav' (Agentic Navigator — metadata routing + on-demand document reading), "
              "or 'auto' (ms if indexed, else mini).",
     ),
     method: str = typer.Option(
@@ -1159,8 +1175,37 @@ def graphrag_ask(
         console.print(agentic_answer.answer)
         return
 
+    if chosen_backend == "nav":
+        if not nav_index_available(settings.sqlite_path):
+            console.print(
+                f"[red]No documents found in {settings.sqlite_path}. "
+                f"Run `ke ingest <pdf>` first to populate the document store.[/red]"
+            )
+            raise typer.Exit(code=2)
+        nav_agent = _build_agentic_nav_agent(settings)
+        nav_opts = AgenticNavOptions(
+            max_docs=settings.agentic_nav_max_docs,
+            max_steps=settings.agentic_nav_max_steps,
+        )
+        nav_answer = nav_agent.ask(question, options=nav_opts)
+        if as_json:
+            typer.echo(json.dumps(nav_answer.to_dict(), ensure_ascii=True, indent=2))
+            return
+        console.print(
+            f"[bold cyan]Agentic Navigator — {nav_answer.duration_ms} ms, "
+            f"{len(nav_answer.selected_documents)} doc(s), "
+            f"{nav_answer.steps} step(s), "
+            f"{nav_answer.tokens.total} tokens[/bold cyan]"
+        )
+        if nav_answer.selected_documents:
+            console.print(f"[dim]Documents:[/dim] {', '.join(nav_answer.selected_documents)}")
+        console.print(nav_answer.answer)
+        return
+
     if chosen_backend != "mini":
-        raise typer.BadParameter(f"unknown backend: {backend!r} (expected ms | lazy | mini | auto)")
+        raise typer.BadParameter(
+            f"unknown backend: {backend!r} (expected ms | lazy | mini | agentic | nav | auto)"
+        )
 
     default_pdf = settings.project_root / "assets" / "hai_ai_index_report_2025.pdf"
     default_md = settings.artifact_path / "hai_ai_index_report_2025" / "doc.md"
@@ -1238,7 +1283,7 @@ def graphrag_eval(
              "'mini' (lexical BM25 baseline), "
              "'agentic' (multi-step planning + retrieval + critique). "
              "Pass a comma-separated list "
-             "(e.g. 'ms,lazy,mini,agentic') for a side-by-side comparison run, or use "
+             "(e.g. 'ms,lazy,mini,agentic,nav') for a side-by-side comparison run, or use "
              "'both' as a shorthand for 'mini,ms'.",
     ),
     method: str = typer.Option(
@@ -1287,6 +1332,8 @@ def graphrag_eval(
         runs["lazy"] = _run_lazy_eval(cases, settings, top_k_chunks=lazy_top_k)
     if "agentic" in chosen_backends:
         runs["agentic"] = _run_agentic_eval(cases, settings, top_k_per_query=agentic_top_k)
+    if "nav" in chosen_backends:
+        runs["nav"] = _run_agentic_nav_eval(cases, settings)
     if "ms" in chosen_backends:
         runs["ms"] = _run_ms_eval(
             cases, settings,
@@ -1337,13 +1384,14 @@ def _parse_backends(spec: str) -> list[str]:
     if raw == "both":
         return ["mini", "ms"]
     parts = [p.strip() for p in raw.split(",") if p.strip()]
-    valid = {"mini", "ms", "lazy", "agentic"}
+    valid = {"mini", "ms", "lazy", "agentic", "nav"}
     seen: set[str] = set()
     ordered: list[str] = []
     for p in parts:
         if p not in valid:
             raise typer.BadParameter(
-                f"unknown backend: {p!r} (expected combination of mini | ms | lazy | agentic, or 'both')"
+                f"unknown backend: {p!r} (expected combination of "
+                f"mini | ms | lazy | agentic | nav, or 'both')"
             )
         if p not in seen:
             seen.add(p)
@@ -1372,11 +1420,18 @@ def _run_mini_eval(
         eval_question = case.query_rewrite or case.question
         case_top_k = max(1, case.top_k or top_k)
         queries = _expand_queries(eval_question, rewriter, n=rewrite_n)
+        started = time.perf_counter()
         if rewriter is not None and len(queries) > 1:
             result = agent.ask_multi(queries, top_k=case_top_k, include_graph=False)
         else:
             result = agent.ask(eval_question, top_k=case_top_k, include_graph=False)
-        results.append(evaluate_case(case, result.hits, mode="retrieval"))
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        evaluated = evaluate_case(case, result.hits, mode="retrieval")
+        # mini is a pure-lexical baseline: no LLM, so token cost is zero.
+        evaluated.latency_ms = elapsed_ms
+        evaluated.tokens_in = 0
+        evaluated.tokens_out = 0
+        results.append(evaluated)
     return results
 
 
@@ -1418,14 +1473,19 @@ def _run_ms_eval(
     from knowledge_extraction.application.services.graphrag_agent import RetrievalHit
 
     agent = MsGraphRagAgent(settings)
+    # The MS GraphRAG CLI only accepts local|global|drift|basic. "auto" is our
+    # sentinel for "let the agent route per-question" — map it to None so the
+    # agent's _route_method picks a concrete method.
+    chosen_method = None if method == "auto" else method
     results = []
     for idx, case in enumerate(cases, start=1):
         eval_question = case.query_rewrite or case.question
         console.print(f"[dim]ms[/dim] [{idx}/{len(cases)}] {case.case_id}: {eval_question[:80]}")
+        started = time.perf_counter()
         try:
             answer = agent.ask(
                 eval_question,
-                method=method,  # type: ignore[arg-type]
+                method=chosen_method,  # type: ignore[arg-type]
                 community_level=community_level,
                 response_type=response_type,
                 timeout_seconds=timeout_seconds,
@@ -1437,14 +1497,21 @@ def _run_ms_eval(
                 text=answer.answer,
                 meta={"method": answer.method, "duration_ms": answer.duration_ms},
             )
-            results.append(evaluate_case(case, [synthetic_hit], mode="synthesis"))
+            evaluated = evaluate_case(case, [synthetic_hit], mode="synthesis")
+            # The MS GraphRAG CLI does not surface token counts, so leave
+            # tokens_* as None (reported as n/a by the benchmark).
+            evaluated.latency_ms = answer.duration_ms
+            evaluated.extra = {"method": answer.method}
+            results.append(evaluated)
         except (RuntimeError, IndexNotFoundError) as exc:
             console.print(f"  [red]error:[/red] {exc}")
             error_hit = RetrievalHit(
                 kind="ms_error", id=f"ms-error:{case.case_id}", score=0.0,
                 text=f"[ms-graphrag error: {exc}]", meta={},
             )
-            results.append(evaluate_case(case, [error_hit], mode="synthesis"))
+            evaluated = evaluate_case(case, [error_hit], mode="synthesis")
+            evaluated.latency_ms = int((time.perf_counter() - started) * 1000)
+            results.append(evaluated)
     return results
 
 
@@ -1477,6 +1544,7 @@ def _run_lazy_eval(
     for idx, case in enumerate(cases, start=1):
         eval_question = case.query_rewrite or case.question
         console.print(f"[dim]lazy[/dim] [{idx}/{len(cases)}] {case.case_id}: {eval_question[:80]}")
+        started = time.perf_counter()
         try:
             answer = agent.ask(eval_question, top_k_chunks=top_k_chunks)
             synthetic_hit = RetrievalHit(
@@ -1490,14 +1558,21 @@ def _run_lazy_eval(
                     "chunks": len(answer.chunks),
                 },
             )
-            results.append(evaluate_case(case, [synthetic_hit], mode="synthesis"))
+            evaluated = evaluate_case(case, [synthetic_hit], mode="synthesis")
+            t = answer.tokens
+            evaluated.latency_ms = answer.duration_ms
+            evaluated.tokens_in = t.extract_input + t.synth_input
+            evaluated.tokens_out = t.extract_output + t.synth_output
+            results.append(evaluated)
         except RuntimeError as exc:
             console.print(f"  [red]error:[/red] {exc}")
             error_hit = RetrievalHit(
                 kind="lazy_error", id=f"lazy-error:{case.case_id}", score=0.0,
                 text=f"[lazy-graphrag error: {exc}]", meta={},
             )
-            results.append(evaluate_case(case, [error_hit], mode="synthesis"))
+            evaluated = evaluate_case(case, [error_hit], mode="synthesis")
+            evaluated.latency_ms = int((time.perf_counter() - started) * 1000)
+            results.append(evaluated)
     return results
 
 
@@ -1544,6 +1619,7 @@ def _run_agentic_eval(
     for idx, case in enumerate(cases, start=1):
         eval_question = case.query_rewrite or case.question
         console.print(f"[dim]agentic[/dim] [{idx}/{len(cases)}] {case.case_id}: {eval_question[:80]}")
+        started = time.perf_counter()
         try:
             opts = AgenticSearchOptions(
                 max_rounds=settings.agentic_max_rounds,
@@ -1566,14 +1642,110 @@ def _run_agentic_eval(
                     "evidence_sufficient": answer.critique.sufficient,
                 },
             )
-            results.append(evaluate_case(case, [synthetic_hit], mode="synthesis"))
+            evaluated = evaluate_case(case, [synthetic_hit], mode="synthesis")
+            t = answer.tokens
+            evaluated.latency_ms = answer.duration_ms
+            evaluated.tokens_in = t.plan_input + t.critic_input + t.synth_input
+            evaluated.tokens_out = t.plan_output + t.critic_output + t.synth_output
+            evaluated.extra = {
+                "rounds": float(answer.rounds),
+                "subquestions_count": float(len(answer.plan.subquestions)),
+                "evidence_count": float(len(answer.evidence)),
+                "critic_confidence": float(answer.critique.confidence),
+                "evidence_sufficient": float(answer.critique.sufficient),
+            }
+            results.append(evaluated)
         except RuntimeError as exc:
             console.print(f"  [red]error:[/red] {exc}")
             error_hit = RetrievalHit(
                 kind="agentic_error", id=f"agentic-error:{case.case_id}", score=0.0,
                 text=f"[agentic error: {exc}]", meta={},
             )
-            results.append(evaluate_case(case, [error_hit], mode="synthesis"))
+            evaluated = evaluate_case(case, [error_hit], mode="synthesis")
+            evaluated.latency_ms = int((time.perf_counter() - started) * 1000)
+            results.append(evaluated)
+    return results
+
+
+def _build_agentic_nav_agent(settings) -> AgenticNavAgent:
+    """Wire an :class:`AgenticNavAgent` from the standard settings.
+
+    Used by both ``graphrag ask --backend nav`` and the eval/bench harness.
+    """
+    from knowledge_extraction.infrastructure.llm.azure_foundry_client import AzureFoundryLLM
+
+    llm = AzureFoundryLLM(settings)
+    prompts = PromptRegistry(settings.prompts_dir)
+    navigator = DocumentNavigator(
+        settings.sqlite_path,
+        settings.artifact_path,
+        max_chars=settings.agentic_nav_max_chars,
+    )
+    return AgenticNavAgent(
+        settings,
+        navigator,
+        llm,
+        prompts,
+        router_model=settings.agentic_nav_router_model or None,
+        navigator_model=settings.agentic_nav_navigator_model or None,
+        synthesis_model=settings.agentic_nav_synthesis_model or None,
+    )
+
+
+def _run_agentic_nav_eval(
+    cases: list[GraphRagEvalCase],
+    settings,
+) -> list:
+    """Run each case through AgenticNavAgent and evaluate the synthesized answer."""
+    from knowledge_extraction.application.services.graphrag_agent import RetrievalHit
+
+    if not nav_index_available(settings.sqlite_path):
+        raise typer.BadParameter(
+            f"No documents found in {settings.sqlite_path}. Run `ke ingest <pdf>` first."
+        )
+    agent = _build_agentic_nav_agent(settings)
+    opts = AgenticNavOptions(
+        max_docs=settings.agentic_nav_max_docs,
+        max_steps=settings.agentic_nav_max_steps,
+    )
+    results = []
+    for idx, case in enumerate(cases, start=1):
+        eval_question = case.query_rewrite or case.question
+        console.print(f"[dim]nav[/dim] [{idx}/{len(cases)}] {case.case_id}: {eval_question[:80]}")
+        started = time.perf_counter()
+        try:
+            answer = agent.ask(eval_question, options=opts)
+            synthetic_hit = RetrievalHit(
+                kind="nav_answer",
+                id=f"nav:{case.case_id}",
+                score=1.0,
+                text=answer.answer,
+                meta={
+                    "duration_ms": answer.duration_ms,
+                    "tokens": answer.tokens.total,
+                    "steps": answer.steps,
+                    "selected_documents": len(answer.selected_documents),
+                },
+            )
+            evaluated = evaluate_case(case, [synthetic_hit], mode="synthesis")
+            t = answer.tokens
+            evaluated.latency_ms = answer.duration_ms
+            evaluated.tokens_in = t.route_input + t.nav_input + t.synth_input
+            evaluated.tokens_out = t.route_output + t.nav_output + t.synth_output
+            evaluated.extra = {
+                "steps": float(answer.steps),
+                "selected_documents": float(len(answer.selected_documents)),
+            }
+            results.append(evaluated)
+        except RuntimeError as exc:
+            console.print(f"  [red]error:[/red] {exc}")
+            error_hit = RetrievalHit(
+                kind="nav_error", id=f"nav-error:{case.case_id}", score=0.0,
+                text=f"[nav error: {exc}]", meta={},
+            )
+            evaluated = evaluate_case(case, [error_hit], mode="synthesis")
+            evaluated.latency_ms = int((time.perf_counter() - started) * 1000)
+            results.append(evaluated)
     return results
 
 
@@ -1668,6 +1840,131 @@ def _print_backend_comparison(runs: dict[str, list]) -> None:
 
     summary = ", ".join(f"{b}-only={n}" for b, n in exclusive_wins.items())
     console.print(f"[bold]Exclusive wins:[/bold] {summary} | all-pass={all_pass} | all-fail={all_fail}")
+
+
+_BENCH_SUITE_OPT = typer.Option(
+    Path("config/evals/bench_4way.json"),
+    help="Path to the benchmark suite JSON (curated 6-case suite by default).",
+)
+_BENCH_OUT_DIR_OPT = typer.Option(
+    Path("work/benchmarks"),
+    "--out-dir",
+    help="Directory for the JSON + markdown benchmark artifacts.",
+)
+
+
+@graphrag_app.command("bench")
+def graphrag_bench(
+    suite: Path = _BENCH_SUITE_OPT,
+    backend: str = typer.Option(
+        "mini,lazy,ms,agentic",
+        "--backend",
+        case_sensitive=False,
+        help="Backends to compare (comma-separated subset of mini,lazy,ms,agentic,nav).",
+    ),
+    method: str = typer.Option(
+        "auto", "--method", case_sensitive=False,
+        help="MS GraphRAG search method when --backend includes 'ms'.",
+    ),
+    community_level: int = typer.Option(2, help="MS GraphRAG community level."),
+    response_type: str = typer.Option("Multiple Paragraphs", help="MS GraphRAG response type."),
+    ms_timeout: int = typer.Option(180, help="Per-case timeout (seconds) for MS GraphRAG."),
+    lazy_top_k: int = typer.Option(20, help="[lazy] chunks to retrieve per question."),
+    agentic_top_k: int = typer.Option(8, help="[agentic] evidence items per subquery."),
+    top_k: int = typer.Option(15, help="Default top-k for cases that do not specify one."),
+    out_dir: Path = _BENCH_OUT_DIR_OPT,
+) -> None:
+    """Compare backends on a curated suite: quality + latency + tokens + ingest cost.
+
+    Runs the selected backends over the suite, then reports per-backend quality
+    (pass rate, MRR), per-query latency (p50/p95/total) and token cost, plus the
+    one-off ingestion cost read from the run logs. Writes JSON + markdown to
+    ``out_dir``.
+    """
+    settings = get_settings()
+    settings.ensure_dirs()
+    if not suite.exists():
+        raise typer.BadParameter(f"benchmark suite not found: {suite}")
+
+    chosen_backends = _parse_backends(backend)
+    raw = json.loads(suite.read_text(encoding="utf-8"))
+    raw_cases = raw.get("cases", [])
+    if not isinstance(raw_cases, list) or not raw_cases:
+        raise typer.BadParameter("benchmark suite must define a non-empty 'cases' array")
+    cases = [GraphRagEvalCase.from_dict(c) for c in raw_cases if isinstance(c, dict)]
+
+    runs: dict[str, list] = {}
+    if "mini" in chosen_backends:
+        runs["mini"] = _run_mini_eval(cases, settings, top_k)
+    if "lazy" in chosen_backends:
+        runs["lazy"] = _run_lazy_eval(cases, settings, top_k_chunks=lazy_top_k)
+    if "agentic" in chosen_backends:
+        runs["agentic"] = _run_agentic_eval(cases, settings, top_k_per_query=agentic_top_k)
+    if "nav" in chosen_backends:
+        runs["nav"] = _run_agentic_nav_eval(cases, settings)
+    if "ms" in chosen_backends:
+        runs["ms"] = _run_ms_eval(
+            cases, settings,
+            method=method.lower(),
+            community_level=community_level,
+            response_type=response_type,
+            timeout_seconds=ms_timeout,
+        )
+
+    for name, results in runs.items():
+        _print_eval_table(results, title=f"{name.upper()} GraphRAG eval")
+    if len(runs) > 1:
+        _print_backend_comparison(runs)
+
+    costs = [summarize_cost(name, results) for name, results in runs.items()]
+    ingestion = read_ingestion_stats(settings.log_dir, settings.graphrag_workdir)
+    _print_bench_cost_table(costs, ingestion)
+
+    report = build_report(str(suite), costs, ingestion, runs)
+    markdown = render_markdown(str(suite), costs, ingestion)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    json_path = out_dir / f"bench-{ts}.json"
+    md_path = out_dir / f"bench-{ts}.md"
+    json_path.write_text(json.dumps(report, ensure_ascii=True, indent=2), encoding="utf-8")
+    md_path.write_text(markdown, encoding="utf-8")
+    console.print(f"[green]Wrote[/green] {json_path}")
+    console.print(f"[green]Wrote[/green] {md_path}")
+
+
+def _print_bench_cost_table(costs: list, ingestion) -> None:
+    """Render the per-backend cost/latency table and the ingestion summary."""
+    table = Table(title="Backend cost & latency")
+    table.add_column("backend")
+    table.add_column("passed", justify="right")
+    table.add_column("avg MRR", justify="right")
+    table.add_column("p50", justify="right")
+    table.add_column("p95", justify="right")
+    table.add_column("total", justify="right")
+    table.add_column("tok in", justify="right")
+    table.add_column("tok out", justify="right")
+    table.add_column("tok total", justify="right")
+
+    def ms(value: int | None) -> str:
+        return "n/a" if value is None else f"{value / 1000:.2f}s"
+
+    def num(value: int | None) -> str:
+        return "n/a" if value is None else f"{value:,}"
+
+    for c in costs:
+        table.add_row(
+            c.backend, f"{c.passed}/{c.cases}", f"{c.avg_mrr:.3f}",
+            ms(c.latency_p50_ms), ms(c.latency_p95_ms), ms(c.latency_total_ms),
+            num(c.tokens_in), num(c.tokens_out), num(c.tokens_total),
+        )
+    console.print(table)
+
+    console.print(
+        f"[bold]Ingestion (shared):[/bold] time={ms(ingestion.ingest_duration_ms)} "
+        f"tokens_total={num(ingestion.ingest_total_tokens)} | "
+        f"ms index runtime="
+        f"{'n/a' if ingestion.ms_index_runtime_s is None else f'{ingestion.ms_index_runtime_s:.1f}s'}"
+    )
 
 
 # ── neo4j sub-app: visualise the MS GraphRAG knowledge graph ──────────────

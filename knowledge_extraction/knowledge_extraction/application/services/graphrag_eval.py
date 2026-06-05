@@ -98,6 +98,14 @@ class GraphRagEvalResult:
     reason: str
     top_hit: RetrievalHit | None
     metrics: dict[str, float] = field(default_factory=dict)
+    # Per-case cost/latency telemetry (populated by the eval runners, not by
+    # ``evaluate_case``). ``tokens_*`` are None when the backend does not expose
+    # token counts (e.g. the MS GraphRAG CLI). ``extra`` carries backend-specific
+    # fields such as agentic ``rounds`` or the MS ``method`` used.
+    latency_ms: int | None = None
+    tokens_in: int | None = None
+    tokens_out: int | None = None
+    extra: dict[str, float | str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         out = asdict(self)

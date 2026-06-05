@@ -688,6 +688,7 @@ Invoke with `uv run ke <command>`.
 | `ke graphrag index`                | Just (re)build the MS GraphRAG index from existing chunks|
 | `ke graphrag ask <q> --backend ms\|lazy\|mini\|agentic\|auto` | One-shot question (--method local\|global\|drift\|basic\|auto) |
 | `ke graphrag eval --backend ms,lazy,mini,agentic` | Run an eval suite, optionally side-by-side       |
+| `ke graphrag bench --backend mini,lazy,ms,agentic` | 4-way comparison: quality + latency + tokens + ingest cost → JSON/markdown |
 | `ke webui [--backend ms\|lazy\|mini\|agentic] [--port 8502]` | Launch the Streamlit chat UI (Telemetry + Chat pages) |
 | `ke resume <pdf>`                  | Re-run; checkpointed stages are skipped                  |
 | `ke clean [--yes]`                 | Wipe all derived state (keeps assets/ and config)        |
@@ -698,6 +699,17 @@ per-case metrics (MRR, precision@k, recall@k, citation_recall, top_score) plus
 per-category aggregates. Adversarial cases pass when `top_score <
 min_score_for_grounded`. Suite definition at
 `config/evals/graphrag_eval.json`.
+
+The benchmark harness is at `application/services/benchmark.py` (pure logic) +
+the `graphrag bench` command in `cli/main.py`. It reuses the eval runners, then
+rolls up per-case telemetry — `GraphRagEvalResult.latency_ms / tokens_in /
+tokens_out / extra`, populated by each `_run_*_eval` — into per-backend
+cost/latency (p50/p95/total, token totals) via `summarize_cost`. Ingestion cost
+is read from `work/logs/run-*.jsonl` (latest `ingest` run's `run.finish`) and the
+MS index runtime from GraphRAG's `stats.json` (`read_ingestion_stats`). Tokens are
+`None` (→ `n/a`) when a backend never exposes them (`ms`), distinct from `0` for
+`mini` (no LLM). Curated suite at `config/evals/bench_4way.json`; artifacts land
+in `work/benchmarks/`.
 
 ---
 
@@ -817,7 +829,8 @@ knowledge_extraction/
 │   │   │   ├── drift_detector.py
 │   │   │   ├── prompt_registry.py
 │   │   │   ├── query_rewriter.py           # RRF + LLM/lexical rewrites
-│   │   │   └── graphrag_eval.py            # eval harness
+│   │   │   ├── graphrag_eval.py            # eval harness
+│   │   │   └── benchmark.py                # 4-way bench: cost/latency rollup + report
 │   │   └── use_cases/run_extraction.py  # THE pipeline entry point
 │   ├── infrastructure/
 │   │   ├── ingestion/document_intelligence_adapter.py
@@ -843,7 +856,9 @@ knowledge_extraction/
 │   │   ├── agentic_critic.v1.j2          # critic prompt
 │   │   └── agentic_synthesis.v1.j2       # synthesis prompt
 │   ├── graphrag_prompts/*.txt        # overlay templates for `graphrag init`
-│   └── evals/graphrag_eval.json
+│   └── evals/
+│       ├── graphrag_eval.json        # 32-case validated suite
+│       └── bench_4way.json           # curated 6-case suite for `graphrag bench`
 ├── tests/{unit,integration}/
 ├── work/                             # all runtime artifacts (gitignored)
 ├── architecture.md                   # high-level human-oriented overview

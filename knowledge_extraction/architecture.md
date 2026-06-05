@@ -79,7 +79,7 @@ CLI:
 
 ```
 ke ingest [pdf] --mode discovery|governed [--redo-stage STAGE] [--fresh]
-ke webui [--backend lazy|mini|ms|agentic]
+ke webui [--backend lazy|mini|ms|agentic|nav]
 ```
 
 ## Persistence
@@ -115,7 +115,7 @@ Common panels: stage + per-stage progress, token/cost metrics, failure queue.
 - Retrieval supports type/relationship filters and claim→evidence traversal.
 - Ontology migrations require rebuilding downstream retrieval indexes.
 
-## Four retrieval backends
+## Five retrieval backends
 
 | Backend   | Class | Compute placement | Description |
 |-----------|-------|-------------------|-------------|
@@ -123,6 +123,7 @@ Common panels: stage + per-stage progress, token/cost metrics, failure queue.
 | `ms`      | `MsGraphRagAgent` | Upfront (index build) | Microsoft GraphRAG CLI — pre-built community graph, local/global/drift search |
 | `lazy`    | `LazyGraphRagAgent` | At query time (graph construction) | LazyGraphRAG — JIT ego-graph from BM25 hits, single synthesized answer, zero ingestion cost |
 | `agentic` | `AgenticSearchAgent` | At query time (planning + reasoning + critique) | Bounded multi-step loop: plan → retrieve → inspect → critique → optional follow-up → synthesize |
+| `nav`     | `AgenticNavAgent` | At query time (routing + document navigation) | Agentic Navigator — metadata-first document routing, then a bounded ReAct tool loop that opens the actual document (`doc.md`) and drills into sections/tables/figures on demand |
 
 ### Agentic loop
 
@@ -147,6 +148,45 @@ uv run ke graphrag eval config/evals/graphrag_eval.json --backend mini,lazy,ms,a
 ```
 
 Eval result includes agentic-specific metadata: `rounds`, `subquestions_count`, `follow_up_queries_count`, `critic_confidence`, `evidence_sufficient`.
+
+### Agentic Navigator (`nav`) loop
+
+Unlike the other backends, `nav` does **not** fan out blind chunk retrieval ahead
+of time. It routes on metadata, then navigates the real document:
+
+```
+question
+  → Router (LLM)     — sees a metadata catalog only (titles, counts, captions,
+                       previews) and picks ≤ max_docs candidate documents
+  → Navigator (LLM)  — bounded ReAct tool loop over DocumentNavigator tools:
+                       open_document, read_section, search_document,
+                       get_table, get_figure, finish
+  → Synthesizer (LLM)— grounded answer citing the documents/sections used
+```
+
+`DocumentNavigator` (`application/services/document_navigator.py`) reads directly
+from the SQLite store (raw read-only `sqlite3`) plus the `doc.md` artifact on
+disk, and is schema/filesystem tolerant (missing tables/columns/`doc.md` degrade
+to chunk-text fallbacks). The loop is fully bounded: an allowlisted tool schema,
+clamped args, a `document_id` allowlist, and invalid/no-progress streak caps stop
+runaway loops and keep the transcript inside the context window. Emits `nav.*`
+wide events (`route`, `step`, `synthesis`, `ask`). Eval metadata: `steps`,
+`selected_documents`.
+
+### 4-way benchmark
+
+`ke graphrag bench` reuses the eval runners to compare all four backends on a
+curated suite (`config/evals/bench_4way.json`), reporting quality (pass rate,
+MRR) **and** cost: per-query latency (p50/p95/total) and token usage, plus the
+one-off ingestion cost (read from `work/logs/run-*.jsonl`) and the MS GraphRAG
+index runtime (`stats.json`). Pure rollup logic lives in
+`application/services/benchmark.py`; results are written to `work/benchmarks/`
+as JSON + markdown. Token cost is `None` (`n/a`) for backends that do not expose
+counts (`ms`), distinct from `0` for the LLM-free `mini` baseline.
+
+```bash
+uv run ke graphrag bench --backend mini,lazy,ms,agentic
+```
 
 ### UI integration
 

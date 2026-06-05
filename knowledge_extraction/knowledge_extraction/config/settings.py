@@ -83,6 +83,16 @@ class Settings(BaseSettings):
     agentic_critic_model: str = ""
     agentic_synthesis_model: str = ""
 
+    # Agentic navigation ("nav") settings — metadata-first document routing then
+    # bounded tool-based navigation into the actual document (doc.md + tables/figures).
+    agentic_nav_max_docs: int = 3
+    agentic_nav_max_steps: int = 6
+    agentic_nav_max_chars: int = 4000
+    # Leave empty to fall back to azure_openai_reasoning_model / extraction_model
+    agentic_nav_router_model: str = ""
+    agentic_nav_navigator_model: str = ""
+    agentic_nav_synthesis_model: str = ""
+
     # Microsoft GraphRAG. Resolved at use-time:
     #   1. explicit `graphrag_executable` env var if set
     #   2. else `graphrag` on PATH

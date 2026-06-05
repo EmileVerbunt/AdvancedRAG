@@ -43,6 +43,7 @@ uv run ke ingest --no-build-knowledge-tree
 | `ms`      | ~$87 / ~80 min for HAI corpus | 1 LLM call | SOTA: pre-built entity/community graph |
 | `lazy`    | **$0 — reuses chunks from any normal ingest** | 2 LLM calls (~10–20 s) | LazyGraphRAG: JIT subgraph at query time, no graph build |
 | `agentic` | $0 | 4–10 LLM calls (~20–60 s) | Broad/ambiguous questions; multi-source reasoning; first retrieval likely incomplete |
+| `nav`     | $0 | 3–8 LLM calls (~15–45 s) | Agentic Navigator: metadata-first routing, then opens the actual document and drills into sections/tables/figures on demand |
 
 **Compute placement:**
 
@@ -51,6 +52,7 @@ uv run ke ingest --no-build-knowledge-tree
 | `ms`      | Upfront (index build) |
 | `lazy`    | At query time (graph construction) |
 | `agentic` | At query time (planning + reasoning + critique) |
+| `nav`     | At query time (metadata routing + document navigation) |
 
 ```bash
 uv run ke webui --backend lazy
@@ -82,6 +84,27 @@ Discovery run on an unfamiliar corpus:
 ```bash
 uv run ke ingest <doc.pdf> --mode discovery
 ```
+
+#### 4-way comparison (`ke graphrag bench`)
+
+For an apples-to-apples comparison across all four backends on a small curated
+suite — measuring quality **and** cost — use `graphrag bench`:
+
+```bash
+uv run ke graphrag bench --backend mini,lazy,ms,agentic
+```
+
+It runs the curated 6-case suite (`config/evals/bench_4way.json`), then reports:
+
+- per-backend quality (pass rate, avg MRR) and the per-case win/loss table;
+- per-query **latency** (p50 / p95 / total) and **token cost** (in / out / total),
+  with `n/a` where a backend does not expose token counts (`ms`);
+- the one-off **ingestion cost** (time + tokens) read from `work/logs/run-*.jsonl`,
+  plus the MS GraphRAG index runtime from its `stats.json`.
+
+Results are written to `work/benchmarks/bench-<ts>.{json,md}`. Tokens are `0`
+(not `n/a`) for `mini` because it never calls an LLM; the distinction between
+"zero cost" and "not measured" is preserved throughout.
 
 ## Visualize the graph (Neo4j)
 
@@ -132,6 +155,14 @@ AZURE_OPENAI_AGENTIC_SYNTHESIS_MODEL=   # defaults to AZURE_OPENAI_EXTRACTION_MO
 AGENTIC_MAX_ROUNDS=2
 AGENTIC_MAX_SUBQUESTIONS=5
 AGENTIC_TOP_K_PER_QUERY=8
+
+# Agentic Navigator (`nav`) — metadata routing + on-demand document reading
+AGENTIC_NAV_MAX_DOCS=3                   # max documents the router may select
+AGENTIC_NAV_MAX_STEPS=6                  # max tool-navigation steps
+AGENTIC_NAV_MAX_CHARS=4000              # per-observation truncation budget
+AGENTIC_NAV_ROUTER_MODEL=               # defaults to AZURE_OPENAI_REASONING_MODEL
+AGENTIC_NAV_NAVIGATOR_MODEL=            # defaults to AZURE_OPENAI_REASONING_MODEL
+AGENTIC_NAV_SYNTHESIS_MODEL=            # defaults to AZURE_OPENAI_EXTRACTION_MODEL
 ```
 
 ## Layout
@@ -173,7 +204,7 @@ ke ingest [pdf|dir] [--mode discovery|governed]    # extract one PDF, a director
 ke resume <pdf> [--mode …] [--pages N]             # re-run; already-checkpointed stages are skipped
 ke stats                                           # persistence + governance + drift summary
 ke clean [--yes]                                   # wipe all derived state (keeps assets/ and config)
-ke webui [--backend lazy|mini|ms|agentic] [--port 8502]    # Streamlit UI (Telemetry + Chat pages)
+ke webui [--backend lazy|mini|ms|agentic|nav] [--port 8502]    # Streamlit UI (Telemetry + Chat pages)
 
 ke ontology list                                   # show all versions and proposals
 ke ontology show <version>                         # print ontology YAML
@@ -184,11 +215,13 @@ ke ontology propose <yaml_file>  [--base VERSION]  # submit a YAML as a new prop
 ke ontology migrate <from_version> <to_version>    # relabel existing graph nodes
 
 ke graphrag index                                  # (re-)run Microsoft GraphRAG indexing
-ke graphrag ask <question> [--backend ms|lazy|mini|agentic|auto]
+ke graphrag ask <question> [--backend ms|lazy|mini|agentic|nav|auto]
                             [--method local|global|drift|basic|auto]
                             [--top-k N] [--rewrite none|lexical|llm] [--json]
-ke graphrag eval [--suite PATH] [--backend ms|lazy|mini|agentic|both|<comma-list>]
+ke graphrag eval [--suite PATH] [--backend ms|lazy|mini|agentic|nav|both|<comma-list>]
                  [--method …] [--json]             # run scored eval suite against one or more backends
+ke graphrag bench [--backend mini,lazy,ms,agentic] [--suite PATH] [--out-dir DIR]
+                  # 4-way comparison: quality + latency + tokens + ingest cost → JSON + markdown
 
 ke neo4j up      # start Neo4j 5 + APOC + GDS in Docker
 ke neo4j load    # import latest GraphRAG parquets into Neo4j
