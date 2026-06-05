@@ -251,7 +251,7 @@ class AgenticNavAgent:
                 model=self._router_model,
                 system=prompt.system,
                 user=prompt.user,
-                max_tokens=512,
+                max_tokens=1536,
             )
             ev.update(input_tokens=resp.input_tokens, output_tokens=resp.output_tokens)
 
@@ -314,10 +314,17 @@ class AgenticNavAgent:
                 break
 
             if tool not in NAV_TOOLS:
-                observation = (
-                    f"error: unknown tool {tool!r}. "
-                    f"Valid tools: {', '.join(sorted(NAV_TOOLS))}."
-                )
+                if tool:
+                    observation = (
+                        f"error: unknown tool {tool!r}. "
+                        f"Valid tools: {', '.join(sorted(NAV_TOOLS))}."
+                    )
+                else:
+                    observation = (
+                        "error: no tool was returned. Respond with a single JSON object "
+                        '{"thought": "...", "tool": "<one of '
+                        f"{', '.join(sorted(NAV_TOOLS))}>\", \"args\": {{...}}}}."
+                    )
                 invalid_streak += 1
                 transcript.append(NavStep(thought, tool or "(none)", args, observation))
                 if invalid_streak >= _MAX_INVALID_STREAK:
@@ -411,7 +418,7 @@ class AgenticNavAgent:
                 model=self._navigator_model,
                 system=prompt.system,
                 user=prompt.user,
-                max_tokens=512,
+                max_tokens=2048,
             )
             ev.update(input_tokens=resp.input_tokens, output_tokens=resp.output_tokens)
         return _safe_json(resp.text), resp.input_tokens, resp.output_tokens

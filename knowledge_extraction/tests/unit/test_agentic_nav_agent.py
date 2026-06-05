@@ -358,6 +358,24 @@ def test_invalid_tool_streak_breaks_loop(settings: Settings, prompts: PromptRegi
     assert all(s.observation.startswith("error: unknown tool") for s in result.transcript)
 
 
+def test_empty_step_response_gets_no_tool_nudge(
+    settings: Settings, prompts: PromptRegistry
+) -> None:
+    # A reasoning model that exhausts its token budget returns empty content ("{}"),
+    # which parses to no tool. The loop should nudge with a distinct message and
+    # break after the invalid streak rather than silently spinning.
+    route = '{"document_ids": ["doc1"]}'
+    empty = "{}"
+    synth = '{"answer": "stopped"}'
+    llm = _StubLLM([route, empty, empty, empty, empty, synth])
+
+    agent = _agent(settings, prompts, llm)
+    result = agent.ask("q", options=AgenticNavOptions(max_steps=10))
+    assert result.steps == 3
+    assert all(s.tool == "(none)" for s in result.transcript)
+    assert all(s.observation.startswith("error: no tool was returned") for s in result.transcript)
+
+
 def test_unknown_document_id_is_rejected(settings: Settings, prompts: PromptRegistry) -> None:
     route = '{"document_ids": ["doc1"]}'
     bad_doc = '{"tool": "read_section", "args": {"document_id": "doc2", "query": "x"}}'
