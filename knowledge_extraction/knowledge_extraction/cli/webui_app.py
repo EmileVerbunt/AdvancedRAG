@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -771,6 +772,18 @@ def _render_telemetry_page(settings: Settings) -> None:
         )
 
 
+def _render_query_footer(stats: dict[str, Any]) -> None:
+    """Render a persistent post-query footer with total wall-clock time and tokens spent."""
+    elapsed = float(stats.get("elapsed_s", 0.0) or 0.0)
+    tokens = stats.get("tokens")
+    extra = str(stats.get("extra", "") or "")
+    tok = f"{int(tokens):,}" if isinstance(tokens, (int, float)) else "n/a"
+    line = f"⏱ **Total time:** {elapsed:.1f}s  ·  🧮 **Tokens spent:** {tok}"
+    if extra:
+        line += f"  ·  {extra}"
+    st.caption(line)
+
+
 def _render_demo_panel(settings: Settings) -> None:
     """Render the curated demo-query ladder as always-visible one-click presets (right column)."""
     st.markdown("### 🎬 Demo queries")
@@ -881,6 +894,8 @@ def _render_chat_column(settings: Settings, default_backend: str) -> None:
                     response_type=str(message["ms_debug"].get("response_type", "Multiple Paragraphs")),
                     answer_payload=message["ms_debug"],
                 )
+            if message.get("stats"):
+                _render_query_footer(message["stats"])
 
     prompt = st.chat_input("Ask a question about your ingested knowledge base")
     if not prompt:
@@ -893,6 +908,7 @@ def _render_chat_column(settings: Settings, default_backend: str) -> None:
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
+        t0 = time.perf_counter()
         try:
             if backend == "lazy":
                 agent = _build_lazy_agent(settings)
@@ -909,12 +925,14 @@ def _render_chat_column(settings: Settings, default_backend: str) -> None:
                 )
                 st.markdown(answer.answer)
                 _render_evidence_panel(settings=settings, evidence=evidence)
-                st.caption(f"LazyGraphRAG · {answer.duration_ms} ms · tokens={answer.tokens.total}")
+                stats = {"elapsed_s": time.perf_counter() - t0, "tokens": answer.tokens.total}
+                _render_query_footer(stats)
                 st.session_state.messages.append(
                     {
                         "role": "assistant",
                         "text": answer.answer,
                         "evidence": evidence,
+                        "stats": stats,
                     }
                 )
                 return
@@ -935,11 +953,18 @@ def _render_chat_column(settings: Settings, default_backend: str) -> None:
                 )
                 st.markdown(answer_text)
                 _render_evidence_panel(settings=settings, evidence=evidence)
+                stats = {
+                    "elapsed_s": time.perf_counter() - t0,
+                    "tokens": 0,
+                    "extra": "lexical retrieval (no LLM)",
+                }
+                _render_query_footer(stats)
                 st.session_state.messages.append(
                     {
                         "role": "assistant",
                         "text": answer_text,
                         "evidence": evidence,
+                        "stats": stats,
                     }
                 )
                 return
@@ -986,8 +1011,14 @@ def _render_chat_column(settings: Settings, default_backend: str) -> None:
                     f"Agentic RAG · {answer.duration_ms} ms · "
                     f"tokens={answer.tokens.total} · rounds={answer.rounds}"
                 )
+                stats = {
+                    "elapsed_s": time.perf_counter() - t0,
+                    "tokens": answer.tokens.total,
+                    "extra": f"rounds={answer.rounds}",
+                }
+                _render_query_footer(stats)
                 st.session_state.messages.append(
-                    {"role": "assistant", "text": answer.answer}
+                    {"role": "assistant", "text": answer.answer, "stats": stats}
                 )
                 return
 
@@ -1018,8 +1049,14 @@ def _render_chat_column(settings: Settings, default_backend: str) -> None:
                     f"tokens={answer.tokens.total} · docs={len(answer.selected_documents)} · "
                     f"steps={answer.steps}"
                 )
+                stats = {
+                    "elapsed_s": time.perf_counter() - t0,
+                    "tokens": answer.tokens.total,
+                    "extra": f"docs={len(answer.selected_documents)} · steps={answer.steps}",
+                }
+                _render_query_footer(stats)
                 st.session_state.messages.append(
-                    {"role": "assistant", "text": answer.answer}
+                    {"role": "assistant", "text": answer.answer, "stats": stats}
                 )
                 return
 
@@ -1051,12 +1088,19 @@ def _render_chat_column(settings: Settings, default_backend: str) -> None:
                 response_type=ms_response_type,
                 answer_payload=payload,
             )
+            stats = {
+                "elapsed_s": time.perf_counter() - t0,
+                "tokens": None,
+                "extra": "tokens not captured (graphrag subprocess)",
+            }
+            _render_query_footer(stats)
             st.session_state.messages.append(
                 {
                     "role": "assistant",
                     "text": ms_answer.answer,
                     "question": prompt,
                     "ms_debug": payload,
+                    "stats": stats,
                 }
             )
         except IndexNotFoundError as exc:
