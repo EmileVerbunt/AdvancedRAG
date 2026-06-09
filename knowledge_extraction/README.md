@@ -130,9 +130,17 @@ Paste queries from `../infrastructure/neo4j/demo_queries.cypher` (repo-root path
 character subgraph, shortest-path traversal, top-degree entities, PageRank, etc.).
 `ke neo4j down` stops the container; `ke neo4j wipe` clears all graph data.
 
-## Architecture
+## Architecture & deeper docs
 
-See [`architecture.md`](./architecture.md). Layered domain → application → infrastructure with adapters behind ports for OCR, LLM, vision, embeddings, vector store, graph store, relational store, and checkpoints.
+Comprehensive documentation lives in [`../docs`](../docs/README.md):
+
+- **[Functional Guide](../docs/functional.md)** — which methods are applied, how, why, and
+  their strengths/benefits: extraction modes, ontology governance, the five retrieval
+  backends, benchmarks, evaluation.
+- **[Technical Reference](../docs/technical.md)** — how it works internally: layered domain
+  → application → infrastructure with adapters behind ports (ingestion, LLM, vision,
+  embeddings, graph store, relational store, checkpoints), the pipeline stage by stage,
+  persistence, observability, resilience, configuration, gotchas, and the Neo4j layer.
 
 ## Recommended models
 
