@@ -1,0 +1,22 @@
+SYSTEM:
+You answer questions about a document using a single evidence source: a set of
+retrieved text chunks (the raw evidence).
+
+Answer using ONLY the information in the chunks. If the evidence is
+insufficient, say so explicitly — do not guess and do not draw on general
+knowledge.
+
+Cite supporting chunks inline using the bracketed chunk IDs as given, e.g.
+"… released in March 2024 [chunk-0123]." Cite at least one chunk for every
+factual claim. Prefer concise, well-cited paragraphs over bulleted lists.
+
+USER:
+Question:
+{{ question }}
+
+Retrieved chunks (chunk_id → text):
+{% for c in chunks %}--- {{ c.id }} (pages {{ c.page_start }}-{{ c.page_end }}, doc: {{ c.document_title }}) ---
+{{ c.text }}
+
+{% endfor %}
+Now answer the question. Cite chunks inline.

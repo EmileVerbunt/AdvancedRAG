@@ -38,6 +38,10 @@ from knowledge_extraction.application.services.benchmark import (
     summarize_cost,
 )
 from knowledge_extraction.application.services.chunk_retriever import ChunkRetriever
+from knowledge_extraction.application.services.dense_rag_agent import (
+    DenseRagAgent,
+    dense_index_available,
+)
 from knowledge_extraction.application.services.document_navigator import (
     DocumentNavigator,
     nav_index_available,
@@ -928,7 +932,7 @@ def webui(
         "lazy",
         "--backend",
         "-b",
-        help="Default retrieval backend for the Chat page: lazy | mini | ms.",
+        help="Default retrieval backend for the Chat page: lazy | dense | mini | ms.",
     ),
     port: int = typer.Option(8502, help="Port for Streamlit"),
     host: str = typer.Option("localhost", help="Host"),
@@ -947,8 +951,8 @@ def webui(
         raise typer.Exit(code=1) from None
 
     chosen = backend.lower().strip()
-    if chosen not in {"lazy", "mini", "ms", "agentic", "nav"}:
-        raise typer.BadParameter("backend must be one of: lazy, mini, ms, agentic, nav")
+    if chosen not in {"lazy", "mini", "ms", "dense", "agentic", "nav"}:
+        raise typer.BadParameter("backend must be one of: lazy, mini, ms, dense, agentic, nav")
 
     app_path = _resolve_streamlit_app_path("knowledge_extraction.cli.webui_app", "webui_app.py")
     if not app_path.exists():
@@ -1068,6 +1072,7 @@ def graphrag_ask(
         "auto", "--backend", "-b",
         help="Retrieval backend: 'ms' (Microsoft GraphRAG, default when indexed), "
              "'lazy' (LazyGraphRAG — JIT subgraph at query time, no index), "
+             "'dense' (plain retrieve-and-read RAG — evidence + synthesis, no graph), "
              "'mini' (lexical BM25 baseline), "
              "'agentic' (multi-step planning + retrieval + critique), "
              "'nav' (Agentic Navigator — metadata routing + on-demand document reading), "
@@ -1126,6 +1131,26 @@ def graphrag_ask(
             return
         console.print(f"[bold cyan]MS GraphRAG ({answer.method}) — {answer.duration_ms} ms[/bold cyan]")
         console.print(answer.answer)
+        return
+
+    if chosen_backend == "dense":
+        if not dense_index_available(settings):
+            console.print(
+                f"[red]No chunks found in {settings.sqlite_path}. "
+                f"Run `ke ingest <pdf>` first to populate the chunk store.[/red]"
+            )
+            raise typer.Exit(code=2)
+        dense_agent = _build_dense_agent(settings)
+        dense_answer = dense_agent.ask(question, top_k_chunks=top_k)
+        if as_json:
+            typer.echo(json.dumps(dense_answer.to_dict(), ensure_ascii=True, indent=2))
+            return
+        console.print(
+            f"[bold cyan]Dense RAG — {dense_answer.duration_ms} ms, "
+            f"{len(dense_answer.chunks)} chunks, "
+            f"{dense_answer.tokens.total} tokens[/bold cyan]"
+        )
+        console.print(dense_answer.answer)
         return
 
     if chosen_backend == "lazy":
@@ -1204,7 +1229,7 @@ def graphrag_ask(
 
     if chosen_backend != "mini":
         raise typer.BadParameter(
-            f"unknown backend: {backend!r} (expected ms | lazy | mini | agentic | nav | auto)"
+            f"unknown backend: {backend!r} (expected ms | lazy | dense | mini | agentic | nav | auto)"
         )
 
     default_pdf = settings.project_root / "assets" / "hai_ai_index_report_2025.pdf"
@@ -1330,6 +1355,8 @@ def graphrag_eval(
         runs["mini"] = _run_mini_eval(cases, settings, top_k, rewriter=rewriter, rewrite_n=rewrite_n)
     if "lazy" in chosen_backends:
         runs["lazy"] = _run_lazy_eval(cases, settings, top_k_chunks=lazy_top_k)
+    if "dense" in chosen_backends:
+        runs["dense"] = _run_dense_eval(cases, settings, top_k_chunks=lazy_top_k)
     if "agentic" in chosen_backends:
         runs["agentic"] = _run_agentic_eval(cases, settings, top_k_per_query=agentic_top_k)
     if "nav" in chosen_backends:
@@ -1384,7 +1411,7 @@ def _parse_backends(spec: str) -> list[str]:
     if raw == "both":
         return ["mini", "ms"]
     parts = [p.strip() for p in raw.split(",") if p.strip()]
-    valid = {"mini", "ms", "lazy", "agentic", "nav"}
+    valid = {"mini", "ms", "lazy", "dense", "agentic", "nav"}
     seen: set[str] = set()
     ordered: list[str] = []
     for p in parts:
@@ -1524,6 +1551,67 @@ def _build_lazy_agent(settings) -> LazyGraphRagAgent:
     prompts = PromptRegistry(settings.prompts_dir)
     chunk_retriever = ChunkRetriever(settings.sqlite_path)
     return LazyGraphRagAgent(settings, chunk_retriever, llm, prompts)
+
+
+def _build_dense_agent(settings) -> DenseRagAgent:
+    """Wire a :class:`DenseRagAgent` from the standard settings.
+
+    Used by both ``graphrag ask --backend dense`` and the eval harness.
+    """
+    llm = AzureFoundryLLM(settings)
+    prompts = PromptRegistry(settings.prompts_dir)
+    chunk_retriever = ChunkRetriever(settings.sqlite_path)
+    return DenseRagAgent(settings, chunk_retriever, llm, prompts)
+
+
+def _run_dense_eval(
+    cases: list[GraphRagEvalCase],
+    settings,
+    *,
+    top_k_chunks: int,
+) -> list:
+    """Run each case through Dense RAG and evaluate the synthesized answer."""
+    from knowledge_extraction.application.services.graphrag_agent import RetrievalHit
+
+    if not dense_index_available(settings):
+        raise typer.BadParameter(
+            f"No chunks found in {settings.sqlite_path}. Run `ke ingest <pdf>` first."
+        )
+    agent = _build_dense_agent(settings)
+    results = []
+    for idx, case in enumerate(cases, start=1):
+        eval_question = case.query_rewrite or case.question
+        console.print(f"[dim]dense[/dim] [{idx}/{len(cases)}] {case.case_id}: {eval_question[:80]}")
+        started = time.perf_counter()
+        try:
+            answer = agent.ask(eval_question, top_k_chunks=top_k_chunks)
+            synthetic_hit = RetrievalHit(
+                kind="dense_answer",
+                id=f"dense:{case.case_id}",
+                score=1.0,
+                text=answer.answer,
+                meta={
+                    "duration_ms": answer.duration_ms,
+                    "tokens": answer.tokens.total,
+                    "chunks": len(answer.chunks),
+                },
+            )
+            evaluated = evaluate_case(case, [synthetic_hit], mode="synthesis")
+            t = answer.tokens
+            evaluated.latency_ms = answer.duration_ms
+            evaluated.tokens_in = t.synth_input
+            evaluated.tokens_out = t.synth_output
+            results.append(evaluated)
+        except RuntimeError as exc:
+            console.print(f"  [red]error:[/red] {exc}")
+            error_hit = RetrievalHit(
+                kind="dense_error", id=f"dense-error:{case.case_id}", score=0.0,
+                text=f"[dense-rag error: {exc}]", meta={},
+            )
+            evaluated = evaluate_case(case, [error_hit], mode="synthesis")
+            evaluated.latency_ms = int((time.perf_counter() - started) * 1000)
+            results.append(evaluated)
+    return results
 
 
 def _run_lazy_eval(
@@ -1898,6 +1986,8 @@ def graphrag_bench(
         runs["mini"] = _run_mini_eval(cases, settings, top_k)
     if "lazy" in chosen_backends:
         runs["lazy"] = _run_lazy_eval(cases, settings, top_k_chunks=lazy_top_k)
+    if "dense" in chosen_backends:
+        runs["dense"] = _run_dense_eval(cases, settings, top_k_chunks=lazy_top_k)
     if "agentic" in chosen_backends:
         runs["agentic"] = _run_agentic_eval(cases, settings, top_k_per_query=agentic_top_k)
     if "nav" in chosen_backends:

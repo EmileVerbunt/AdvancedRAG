@@ -20,6 +20,10 @@ from knowledge_extraction.application.services.agentic_search_agent import (
     AgenticSearchOptions,
 )
 from knowledge_extraction.application.services.chunk_retriever import ChunkRetriever
+from knowledge_extraction.application.services.dense_rag_agent import (
+    DenseRagAgent,
+    DenseRagAnswer,
+)
 from knowledge_extraction.application.services.document_navigator import DocumentNavigator
 from knowledge_extraction.application.services.graphrag_agent import (
     MiniGraphRagAgent,
@@ -48,6 +52,7 @@ DEFAULT_PRICES = {
 
 BACKEND_LABELS = {
     "mini": "Evidence Retriever (Mini, no synthesis)",
+    "dense": "Dense RAG (evidence retrieval + synthesis, no graph)",
     "lazy": "LazyGraphRAG (synthesized answer + citations)",
     "ms": "Microsoft GraphRAG (indexed synthesis)",
     "agentic": "Agentic RAG (plan → retrieve → critique → synthesize)",
@@ -187,6 +192,16 @@ def _load_run(path: str) -> dict[str, Any]:
         "pdf": next((r.get("pdf") for r in records if r.get("pdf")), None),
         "duration_ms": finish.get("duration_ms"),
     }
+
+
+def _build_dense_agent(settings: Settings) -> DenseRagAgent:
+    return DenseRagAgent(
+        settings=settings,
+        chunk_retriever=ChunkRetriever(settings.sqlite_path),
+        llm=AzureFoundryLLM(settings),
+        prompts=PromptRegistry(settings.prompts_dir),
+        model=settings.azure_openai_extraction_model,
+    )
 
 
 def _build_lazy_agent(settings: Settings) -> LazyGraphRagAgent:
@@ -470,7 +485,7 @@ def _render_ms_debug_panel(
 
 def _build_lazy_evidence(
     *,
-    answer: LazyGraphRagAnswer,
+    answer: LazyGraphRagAnswer | DenseRagAnswer,
     figure_ids: set[str],
     table_ids: set[str],
     figure_index: dict[str, FigureRef],
@@ -643,6 +658,15 @@ def _collect_mini_refs(hits: list[RetrievalHit]) -> tuple[set[str], set[str]]:
         if hit.kind == "chunk":
             figure_ids.update(_json_list(hit.meta.get("figure_refs_json")))
             table_ids.update(_json_list(hit.meta.get("table_refs_json")))
+    return figure_ids, table_ids
+
+
+def _collect_dense_refs(answer: DenseRagAnswer) -> tuple[set[str], set[str]]:
+    figure_ids: set[str] = set()
+    table_ids: set[str] = set()
+    for chunk in answer.chunks:
+        figure_ids.update(_json_list(chunk.figure_refs_json))
+        table_ids.update(_json_list(chunk.table_refs_json))
     return figure_ids, table_ids
 
 
@@ -910,7 +934,7 @@ def _render_chat_column(settings: Settings, default_backend: str) -> None:
 
     c1, c2 = st.columns([1, 1])
     # Ordered by increasing complexity: evidence → graphrag → lazygraphrag → agentic → navigator.
-    backend_options = ["mini", "ms", "lazy", "agentic", "nav"]
+    backend_options = ["mini", "dense", "ms", "lazy", "agentic", "nav"]
     default_index = backend_options.index(default_backend) if default_backend in backend_options else 0
     backend = c1.radio(
         "Retrieval mode",
@@ -977,6 +1001,33 @@ def _render_chat_column(settings: Settings, default_backend: str) -> None:
     with st.chat_message("assistant"):
         t0 = time.perf_counter()
         try:
+            if backend == "dense":
+                dense_agent = _build_dense_agent(settings)
+                with st.spinner("Running Dense RAG (retrieval + LLM synthesis)..."):
+                    dense_answer = dense_agent.ask(prompt, top_k_chunks=top_k)
+                figure_ids, table_ids = _collect_dense_refs(dense_answer)
+                evidence = _build_lazy_evidence(
+                    answer=dense_answer,
+                    figure_ids=figure_ids,
+                    table_ids=table_ids,
+                    figure_index=figure_index,
+                    table_index=table_index,
+                    chunk_index=chunk_index,
+                )
+                st.markdown(dense_answer.answer)
+                _render_evidence_panel(settings=settings, evidence=evidence)
+                stats = {"elapsed_s": time.perf_counter() - t0, "tokens": dense_answer.tokens.total}
+                _render_query_footer(stats)
+                st.session_state.messages.append(
+                    {
+                        "role": "assistant",
+                        "text": dense_answer.answer,
+                        "evidence": evidence,
+                        "stats": stats,
+                    }
+                )
+                return
+
             if backend == "lazy":
                 agent = _build_lazy_agent(settings)
                 with st.spinner("Running LazyGraphRAG (retrieval + LLM synthesis)..."):
@@ -1186,7 +1237,7 @@ def _render_chat_column(settings: Settings, default_backend: str) -> None:
 def main() -> None:
     args = _parse_cli()
     default_backend = str(args.backend or "lazy").lower()
-    if default_backend not in {"lazy", "mini", "ms", "agentic", "nav"}:
+    if default_backend not in {"lazy", "mini", "ms", "dense", "agentic", "nav"}:
         default_backend = "lazy"
 
     st.set_page_config(page_title="KE WebUI", page_icon="🧩", layout="wide")
